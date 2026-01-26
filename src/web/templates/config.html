@@ -44,6 +44,11 @@
             <label for="qbittorrent_password">Password</label>
             <input type="password" name="qbittorrent_password" id="qbittorrent_password"
                    value="{{ config.get('qbittorrent_password', 'adminadmin') }}">
+
+            <button type="button" class="secondary" id="test-torrent" style="margin-top: 0.5rem;">
+                Test Connection
+            </button>
+            <div id="torrent-result" style="margin-top: 0.5rem; font-size: 0.875rem;"></div>
         </div>
 
         <div class="card">
@@ -63,6 +68,11 @@
             <input type="text" name="llm_model" id="llm_model"
                    value="{{ config.get('llm_model', 'sonnet') }}"
                    placeholder="sonnet, opus, gpt-4o, llama3.2, etc.">
+
+            <button type="button" class="secondary" id="test-llm" style="margin-top: 0.5rem;">
+                Test Connection
+            </button>
+            <div id="llm-result" style="margin-top: 0.5rem; font-size: 0.875rem;"></div>
 
             <h2 style="margin-top: 1.5rem;">Paths</h2>
 
@@ -105,4 +115,41 @@
     </div>
 </form>
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function testConnection(endpoint, resultId, buttonId) {
+    const btn = document.getElementById(buttonId);
+    const result = document.getElementById(resultId);
+
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    result.innerHTML = '<span style="color: var(--text-dim);">Testing connection...</span>';
+
+    try {
+        const resp = await fetch(endpoint, { method: 'POST' });
+        const data = await resp.json();
+
+        if (data.success) {
+            result.innerHTML = `<span style="color: var(--success);">✓ ${data.message}</span>`;
+        } else {
+            result.innerHTML = `<span style="color: var(--error);">✗ ${data.error}</span>`;
+        }
+    } catch (e) {
+        result.innerHTML = `<span style="color: var(--error);">✗ ${e.message}</span>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Connection';
+    }
+}
+
+document.getElementById('test-torrent').addEventListener('click', () => {
+    testConnection('/api/test/torrent', 'torrent-result', 'test-torrent');
+});
+
+document.getElementById('test-llm').addEventListener('click', () => {
+    testConnection('/api/test/llm', 'llm-result', 'test-llm');
+});
+</script>
 {% endblock %}

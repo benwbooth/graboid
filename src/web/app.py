@@ -371,6 +371,103 @@ async def get_status():
     }
 
 
+@app.post("/api/test/torrent")
+async def test_torrent_connection(request: Request):
+    """Test torrent client connectivity."""
+    user = get_current_user(request)
+    if not user:
+        return {"success": False, "error": "Not authenticated"}
+
+    try:
+        from ..torrent import QBittorrentClient
+        config = load_config_as_dict()
+
+        client_type = config.get("torrent_client", "qbittorrent")
+        if client_type == "auto":
+            client_type = "qbittorrent"
+
+        if client_type == "qbittorrent":
+            client = QBittorrentClient(
+                host=config.get("qbittorrent_host", "localhost"),
+                port=config.get("qbittorrent_port", 8080),
+                username=config.get("qbittorrent_username", "admin"),
+                password=config.get("qbittorrent_password", "adminadmin"),
+            )
+            await client.connect()
+            torrents = await client.get_torrents()
+            await client.disconnect()
+            return {
+                "success": True,
+                "message": f"Connected to qBittorrent. {len(torrents)} active torrents.",
+            }
+        else:
+            return {"success": False, "error": f"Test not implemented for {client_type}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/test/llm")
+async def test_llm_connection(request: Request):
+    """Test LLM provider connectivity."""
+    user = get_current_user(request)
+    if not user:
+        return {"success": False, "error": "Not authenticated"}
+
+    try:
+        config = load_config_as_dict()
+        provider = config.get("llm_provider", "claude_code")
+        model = config.get("llm_model", "sonnet")
+
+        if provider == "claude_code":
+            from ..browser.claude_code_llm import ClaudeCodeChat
+            chat = ClaudeCodeChat(model=model, timeout=30)
+            messages = [{"role": "user", "content": "Respond with exactly: OK"}]
+            result = await chat.ainvoke(messages)
+            if result and result.content:
+                return {
+                    "success": True,
+                    "message": f"Claude Code ({model}) connected. Response: {result.content[:50]}",
+                }
+            return {"success": False, "error": "Empty response"}
+
+        elif provider == "ollama":
+            import httpx
+            host = config.get("ollama_host", "http://localhost:11434")
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{host}/api/tags", timeout=10)
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    return {
+                        "success": True,
+                        "message": f"Ollama connected. {len(models)} models available.",
+                    }
+                return {"success": False, "error": f"HTTP {resp.status_code}"}
+
+        else:
+            # For API-key based providers, just check if key exists
+            import os
+            key_map = {
+                "anthropic": "ANTHROPIC_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "google": "GOOGLE_API_KEY",
+                "openrouter": "OPENROUTER_API_KEY",
+            }
+            key_name = key_map.get(provider)
+            if key_name and os.getenv(key_name):
+                return {
+                    "success": True,
+                    "message": f"{provider} API key found ({key_name})",
+                }
+            elif key_name:
+                return {"success": False, "error": f"Missing {key_name} environment variable"}
+            else:
+                return {"success": False, "error": f"Unknown provider: {provider}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.get("/api/notes/stats")
 async def get_notes_stats():
     """Get notes statistics."""
