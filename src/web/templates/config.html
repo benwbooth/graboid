@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Configuration - Graboid{% endblock %}
+
+{% block content %}
+<h1>Configuration</h1>
+
+{% if request.query_params.get('saved') %}
+<div class="alert success">
+    Configuration saved successfully.
+</div>
+{% endif %}
+
+<form method="post" action="/config">
+    <div class="grid-2">
+        <div class="card">
+            <h2>Torrent Client</h2>
+
+            <label for="torrent_client">Client</label>
+            <select name="torrent_client" id="torrent_client">
+                <option value="auto" {% if config.get('torrent_client') == 'auto' %}selected{% endif %}>Auto-detect</option>
+                <option value="qbittorrent" {% if config.get('torrent_client') == 'qbittorrent' %}selected{% endif %}>qBittorrent</option>
+                <option value="transmission" {% if config.get('torrent_client') == 'transmission' %}selected{% endif %}>Transmission</option>
+                <option value="deluge" {% if config.get('torrent_client') == 'deluge' %}selected{% endif %}>Deluge</option>
+                <option value="rtorrent" {% if config.get('torrent_client') == 'rtorrent' %}selected{% endif %}>rTorrent</option>
+                <option value="aria2" {% if config.get('torrent_client') == 'aria2' %}selected{% endif %}>aria2</option>
+                <option value="embedded" {% if config.get('torrent_client') == 'embedded' %}selected{% endif %}>Embedded (libtorrent)</option>
+            </select>
+
+            <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">qBittorrent Settings</h3>
+
+            <label for="qbittorrent_host">Host</label>
+            <input type="text" name="qbittorrent_host" id="qbittorrent_host"
+                   value="{{ config.get('qbittorrent_host', 'localhost') }}">
+
+            <label for="qbittorrent_port">Port</label>
+            <input type="number" name="qbittorrent_port" id="qbittorrent_port"
+                   value="{{ config.get('qbittorrent_port', 8080) }}">
+
+            <label for="qbittorrent_username">Username</label>
+            <input type="text" name="qbittorrent_username" id="qbittorrent_username"
+                   value="{{ config.get('qbittorrent_username', 'admin') }}">
+
+            <label for="qbittorrent_password">Password</label>
+            <input type="password" name="qbittorrent_password" id="qbittorrent_password"
+                   value="{{ config.get('qbittorrent_password', 'adminadmin') }}">
+        </div>
+
+        <div class="card">
+            <h2>Paths</h2>
+
+            <label for="download_dir">Download Directory</label>
+            <input type="text" name="download_dir" id="download_dir"
+                   value="{{ config.get('download_dir', './downloads') }}">
+
+            <label for="path_mappings">Path Mappings (one per line, host:container)</label>
+            <textarea name="path_mappings" id="path_mappings" rows="4"
+                      placeholder="/mnt/downloads:/downloads">{{ config.get('path_mappings', []) | join('\n') }}</textarea>
+
+            <h2 style="margin-top: 1.5rem;">Browser</h2>
+
+            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
+                <input type="checkbox" name="headless" id="headless" style="width: auto;"
+                       {% if config.get('headless', True) %}checked{% endif %}>
+                <span>Run browser in headless mode</span>
+            </label>
+
+            <h2 style="margin-top: 1.5rem;">Logging</h2>
+
+            <label for="log_level">Log Level</label>
+            <select name="log_level" id="log_level">
+                <option value="DEBUG" {% if config.get('log_level') == 'DEBUG' %}selected{% endif %}>Debug</option>
+                <option value="INFO" {% if config.get('log_level', 'INFO') == 'INFO' %}selected{% endif %}>Info</option>
+                <option value="WARNING" {% if config.get('log_level') == 'WARNING' %}selected{% endif %}>Warning</option>
+                <option value="ERROR" {% if config.get('log_level') == 'ERROR' %}selected{% endif %}>Error</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <span style="color: var(--text-dim);">Config file: </span>
+                <code>{{ config_path }}</code>
+            </div>
+            <button type="submit">Save Configuration</button>
+        </div>
+    </div>
+</form>
+
+{% endblock %}

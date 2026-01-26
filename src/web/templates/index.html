@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Graboid{% endblock %}
+
+{% block content %}
+<h1>Dashboard</h1>
+
+<div class="grid">
+    <div class="card">
+        <h2>Quick Actions</h2>
+        <p style="color: var(--text-dim); margin-bottom: 1rem;">
+            Browse websites and download content using AI-powered automation.
+        </p>
+        <a href="/browser" class="btn">Open Browser View</a>
+        <a href="/config" class="btn secondary" style="margin-left: 0.5rem;">Configure</a>
+    </div>
+
+    <div class="card">
+        <h2>Status</h2>
+        <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;">
+            <div class="status-dot" id="dashboard-status-dot"></div>
+            <span id="dashboard-status-text">{{ "Running: " + current_task if is_running else "Idle" }}</span>
+        </div>
+        <div id="download-stats" hx-get="/api/status" hx-trigger="every 5s" hx-swap="innerHTML">
+            <p style="color: var(--text-dim);">Loading status...</p>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Recent Activity</h2>
+    <div id="messages" class="messages">
+        <p style="color: var(--text-dim);">No recent activity. Start a download to see updates here.</p>
+    </div>
+</div>
+
+<div class="card">
+    <h2>Agent Notes</h2>
+    <div hx-get="/api/notes/stats" hx-trigger="load" hx-swap="innerHTML">
+        <p style="color: var(--text-dim);">Loading...</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Update dashboard status dot
+    function updateDashboardStatus(isRunning, task) {
+        const dot = document.getElementById('dashboard-status-dot');
+        const text = document.getElementById('dashboard-status-text');
+        if (dot) {
+            dot.className = 'status-dot' + (isRunning ? ' running' : '');
+        }
+        if (text) {
+            text.textContent = isRunning ? ('Running: ' + (task || '...')) : 'Idle';
+        }
+    }
+
+    // Override the base handleMessage to update dashboard
+    const originalHandleMessage = handleMessage;
+    handleMessage = function(data) {
+        originalHandleMessage(data);
+        if (data.type === 'status' || data.type === 'init') {
+            updateDashboardStatus(data.is_running, data.task);
+        }
+    };
+</script>
+{% endblock %}

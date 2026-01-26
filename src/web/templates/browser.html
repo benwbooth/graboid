@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}Browser View - Graboid{% endblock %}
+
+{% block content %}
+<h1>Browser View</h1>
+
+<div class="grid-2">
+    <div>
+        <div class="card" style="padding: 0; overflow: hidden;">
+            <div id="browser-view">
+                <img id="browser-screenshot" style="display: none;" alt="Browser Screenshot">
+                <div id="browser-placeholder" class="placeholder">
+                    <p>No browser session active</p>
+                    <p style="font-size: 0.875rem; margin-top: 0.5rem;">Start a browse task to see the browser here</p>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <div style="display: flex; align-items: center; gap: 1rem;">
+                <span style="color: var(--text-dim);">URL:</span>
+                <code id="browser-url" style="flex: 1; color: var(--accent);">-</code>
+            </div>
+        </div>
+    </div>
+
+    <div>
+        <div class="card">
+            <h2>Agent Messages</h2>
+            <div id="messages" class="messages" style="max-height: 600px;">
+                <p style="color: var(--text-dim);">Waiting for agent activity...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Controls</h2>
+            <p style="color: var(--text-dim); margin-bottom: 1rem;">
+                Run tasks from the command line:
+            </p>
+            <code style="display: block; background: var(--bg); padding: 1rem; border-radius: 0.25rem; margin-bottom: 1rem;">
+                graboid browse https://example.com "find download links"
+            </code>
+            <p style="color: var(--text-dim); font-size: 0.875rem;">
+                The browser view will update automatically when a task starts.
+            </p>
+        </div>
+    </div>
+</div>
+{% endblock %}
