@@ -31,6 +31,7 @@ class LLMProvider(str, Enum):
     AWS_BEDROCK = "aws_bedrock"
     AZURE = "azure"
     BROWSER_USE = "browser_use"
+    CLAUDE_CODE = "claude_code"  # Uses claude CLI with Max subscription
 
 
 class NavigationTarget(BaseModel):
@@ -183,6 +184,14 @@ def get_llm(
             model=model or "bu-latest",
             api_key=kwargs.get("api_key") or os.getenv("BROWSER_USE_API_KEY"),
             **{k: v for k, v in kwargs.items() if k != "api_key"},
+        )
+
+    elif provider == LLMProvider.CLAUDE_CODE:
+        from .claude_code_llm import ClaudeCodeChat
+
+        return ClaudeCodeChat(
+            model=model or "sonnet",
+            timeout=kwargs.get("timeout", 120),
         )
 
     else:

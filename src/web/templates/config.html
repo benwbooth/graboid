@@ -47,7 +47,24 @@
         </div>
 
         <div class="card">
-            <h2>Paths</h2>
+            <h2>LLM Provider</h2>
+
+            <label for="llm_provider">Provider</label>
+            <select name="llm_provider" id="llm_provider">
+                <option value="claude_code" {% if config.get('llm_provider', 'claude_code') == 'claude_code' %}selected{% endif %}>Claude Code (Max subscription)</option>
+                <option value="anthropic" {% if config.get('llm_provider') == 'anthropic' %}selected{% endif %}>Anthropic API</option>
+                <option value="openai" {% if config.get('llm_provider') == 'openai' %}selected{% endif %}>OpenAI</option>
+                <option value="ollama" {% if config.get('llm_provider') == 'ollama' %}selected{% endif %}>Ollama (local)</option>
+                <option value="google" {% if config.get('llm_provider') == 'google' %}selected{% endif %}>Google Gemini</option>
+                <option value="openrouter" {% if config.get('llm_provider') == 'openrouter' %}selected{% endif %}>OpenRouter</option>
+            </select>
+
+            <label for="llm_model">Model</label>
+            <input type="text" name="llm_model" id="llm_model"
+                   value="{{ config.get('llm_model', 'sonnet') }}"
+                   placeholder="sonnet, opus, gpt-4o, llama3.2, etc.">
+
+            <h2 style="margin-top: 1.5rem;">Paths</h2>
 
             <label for="download_dir">Download Directory</label>
             <input type="text" name="download_dir" id="download_dir"

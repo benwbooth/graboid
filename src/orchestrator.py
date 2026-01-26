@@ -71,10 +71,12 @@ class Config(BaseSettings):
     download_dir: Path = Path.cwd() / "downloads"
 
     # LLM settings
+    llm_provider: str = "claude_code"  # claude_code, anthropic, openai, ollama, etc.
+    llm_model: str = "sonnet"  # Model name or alias
     ollama_model: str = "llama3.2"
     ollama_host: str = "http://localhost:11434"
     claude_model: str = "claude-sonnet-4-20250514"
-    prefer_local_llm: bool = True
+    prefer_local_llm: bool = False
 
     # Browser settings
     headless: bool = True

@@ -246,6 +246,8 @@ async def config_page(request: Request):
 @app.post("/config")
 async def save_config_form(
     request: Request,
+    llm_provider: str = Form("claude_code"),
+    llm_model: str = Form("sonnet"),
     torrent_client: str = Form("auto"),
     qbittorrent_host: str = Form("localhost"),
     qbittorrent_port: int = Form(8080),
@@ -264,6 +266,8 @@ async def save_config_form(
     mappings = [m.strip() for m in path_mappings.split("\n") if m.strip()]
 
     config_data = {
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
         "torrent_client": torrent_client,
         "qbittorrent_host": qbittorrent_host,
         "qbittorrent_port": qbittorrent_port,
