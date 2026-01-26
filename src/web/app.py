@@ -2,14 +2,19 @@
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
+import os
+import secrets
+import time
 from pathlib import Path
 from typing import Any
 
 import tomllib
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Depends, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -18,12 +23,63 @@ from ..orchestrator import Config, CONFIG_SEARCH_PATHS, EXAMPLE_CONFIG
 
 logger = logging.getLogger(__name__)
 
+# Auth settings
+DEFAULT_USERNAME = os.environ.get("GRABOID_USERNAME", "admin")
+DEFAULT_PASSWORD = os.environ.get("GRABOID_PASSWORD", "adminadmin")
+SESSION_SECRET = os.environ.get("GRABOID_SESSION_SECRET", secrets.token_hex(32))
+SESSION_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
 # FastAPI app
 app = FastAPI(title="Graboid", version="0.1.0")
 
 # Templates
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+
+def sign_session(username: str) -> str:
+    """Create a signed session token."""
+    timestamp = str(int(time.time()))
+    data = f"{username}:{timestamp}"
+    signature = hmac.new(SESSION_SECRET.encode(), data.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{data}:{signature}".encode()).decode()
+
+
+def verify_session(token: str) -> str | None:
+    """Verify session token and return username if valid."""
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        username, timestamp, signature = decoded.rsplit(":", 2)
+
+        # Check signature
+        expected = hmac.new(SESSION_SECRET.encode(), f"{username}:{timestamp}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+
+        # Check expiration
+        if int(time.time()) - int(timestamp) > SESSION_MAX_AGE:
+            return None
+
+        return username
+    except Exception:
+        return None
+
+
+def get_current_user(request: Request) -> str | None:
+    """Get current user from session cookie."""
+    token = request.cookies.get("graboid_session")
+    if not token:
+        return None
+    return verify_session(token)
+
+
+def require_auth(request: Request) -> str:
+    """Dependency that requires authentication."""
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
 
 # Global state for browser monitoring
 class AppState:
@@ -117,11 +173,53 @@ def save_config(data: dict[str, Any], path: Path | None = None):
         f.write("\n".join(lines) + "\n")
 
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    """Login page."""
+    user = get_current_user(request)
+    if user:
+        return RedirectResponse(url="/", status_code=303)
+    error = request.query_params.get("error")
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "error": error,
+    })
+
+
+@app.post("/login")
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    """Handle login form submission."""
+    if username == DEFAULT_USERNAME and password == DEFAULT_PASSWORD:
+        response = RedirectResponse(url="/", status_code=303)
+        token = sign_session(username)
+        response.set_cookie(
+            key="graboid_session",
+            value=token,
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
+    return RedirectResponse(url="/login?error=1", status_code=303)
+
+
+@app.get("/logout")
+async def logout():
+    """Log out the current user."""
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("graboid_session")
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Main dashboard page."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
     return templates.TemplateResponse("index.html", {
         "request": request,
+        "user": user,
         "is_running": state.is_running,
         "current_task": state.current_task,
     })
@@ -130,11 +228,16 @@ async def index(request: Request):
 @app.get("/config", response_class=HTMLResponse)
 async def config_page(request: Request):
     """Configuration page."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
     config_data = load_config_as_dict()
     config_path = find_config_file()
 
     return templates.TemplateResponse("config.html", {
         "request": request,
+        "user": user,
         "config": config_data,
         "config_path": str(config_path) if config_path else "Not found",
     })
@@ -154,6 +257,9 @@ async def save_config_form(
     log_level: str = Form("INFO"),
 ):
     """Save configuration."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
     # Parse path mappings (one per line)
     mappings = [m.strip() for m in path_mappings.split("\n") if m.strip()]
 
@@ -176,6 +282,10 @@ async def save_config_form(
 @app.get("/notes", response_class=HTMLResponse)
 async def notes_page(request: Request):
     """Agent notes page."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
     notes_db = get_notes_db()
     stats = notes_db.get_stats()
     domains = notes_db.get_all_domains()
@@ -186,6 +296,7 @@ async def notes_page(request: Request):
 
     return templates.TemplateResponse("notes.html", {
         "request": request,
+        "user": user,
         "stats": stats,
         "domains": domains,
         "domain_notes": domain_notes,
@@ -195,8 +306,13 @@ async def notes_page(request: Request):
 @app.get("/browser", response_class=HTMLResponse)
 async def browser_page(request: Request):
     """Live browser view page."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
     return templates.TemplateResponse("browser.html", {
         "request": request,
+        "user": user,
         "is_running": state.is_running,
         "current_task": state.current_task,
     })
