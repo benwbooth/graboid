@@ -324,7 +324,7 @@ class LibTCClient(TorrentClient):
 
 
 # Convenience classes for common clients
-class QBittorrentClient(LibTCClient):
+class QBittorrentClient(TorrentClient):
     """qBittorrent client via libtc."""
 
     def __init__(
@@ -336,8 +336,142 @@ class QBittorrentClient(LibTCClient):
         use_https: bool = False,
     ):
         protocol = "https" if use_https else "http"
-        url = f"qbittorrent+{protocol}://{username}:{password}@{host}:{port}"
-        super().__init__(url)
+        self.url = f"{protocol}://{host}:{port}"
+        self.username = username
+        self.password = password
+        self._client = None
+        self._available: bool | None = None
+
+    @property
+    def name(self) -> str:
+        return "qBittorrent"
+
+    def _get_client(self):
+        if self._client is None:
+            from libtc import QBittorrentClient as LibTCQBittorrent
+            self._client = LibTCQBittorrent(
+                url=self.url,
+                username=self.username,
+                password=self.password,
+            )
+        return self._client
+
+    async def is_available(self) -> bool:
+        if self._available is not None:
+            return self._available
+        try:
+            client = self._get_client()
+            list(client.list())  # Test connection
+            self._available = True
+        except Exception as e:
+            logger.debug(f"qBittorrent not available: {e}")
+            self._available = False
+        return self._available
+
+    def _map_state(self, state_str: str) -> TorrentState:
+        state_lower = (state_str or "").lower()
+        if "download" in state_lower:
+            return TorrentState.DOWNLOADING
+        elif "seed" in state_lower or "upload" in state_lower:
+            return TorrentState.SEEDING
+        elif "pause" in state_lower or "stop" in state_lower:
+            return TorrentState.PAUSED
+        elif "check" in state_lower:
+            return TorrentState.CHECKING
+        elif "queue" in state_lower:
+            return TorrentState.QUEUED
+        elif "error" in state_lower:
+            return TorrentState.ERROR
+        return TorrentState.UNKNOWN
+
+    def _torrent_to_status(self, t) -> TorrentStatus:
+        state = self._map_state(str(getattr(t, 'state', '')))
+        progress = getattr(t, 'progress', 0) or 0
+        if progress >= 1.0:
+            state = TorrentState.COMPLETED
+        return TorrentStatus(
+            hash=getattr(t, 'infohash', '') or '',
+            name=getattr(t, 'name', '') or 'Unknown',
+            state=state,
+            progress=progress,
+            size=getattr(t, 'size', 0) or 0,
+            downloaded=int(progress * (getattr(t, 'size', 0) or 0)),
+            upload_speed=getattr(t, 'upload_rate', 0) or 0,
+            download_speed=getattr(t, 'download_rate', 0) or 0,
+            eta=getattr(t, 'eta', -1) or -1,
+            seeds=getattr(t, 'seeders', 0) or 0,
+            peers=getattr(t, 'leechers', 0) or 0,
+            save_path=Path(getattr(t, 'download_path', '') or '.'),
+        )
+
+    async def add_torrent(self, source: str, save_path: Path | None = None, category: str | None = None) -> str:
+        client = self._get_client()
+        try:
+            if source.startswith("magnet:"):
+                torrent = client.add(source, download_path=str(save_path) if save_path else None)
+                return self._extract_hash_from_magnet(source) or getattr(torrent, 'infohash', '')
+            elif source.startswith(("http://", "https://")):
+                torrent = client.add(source, download_path=str(save_path) if save_path else None)
+                return getattr(torrent, 'infohash', '')
+            else:
+                with open(source, "rb") as f:
+                    torrent_data = f.read()
+                torrent = client.add(torrent_data, download_path=str(save_path) if save_path else None)
+                return getattr(torrent, 'infohash', '')
+        except Exception as e:
+            logger.error(f"Failed to add torrent: {e}")
+            raise
+
+    async def get_status(self, torrent_id: str) -> TorrentStatus | None:
+        client = self._get_client()
+        try:
+            for t in client.list():
+                if getattr(t, 'infohash', '').lower() == torrent_id.lower():
+                    return self._torrent_to_status(t)
+        except Exception as e:
+            logger.debug(f"Failed to get torrent status: {e}")
+        return None
+
+    async def list_torrents(self, category: str | None = None) -> list[TorrentStatus]:
+        client = self._get_client()
+        try:
+            return [self._torrent_to_status(t) for t in client.list()]
+        except Exception as e:
+            logger.error(f"Failed to list torrents: {e}")
+            return []
+
+    async def pause(self, torrent_id: str) -> bool:
+        try:
+            client = self._get_client()
+            for t in client.list():
+                if getattr(t, 'infohash', '').lower() == torrent_id.lower():
+                    t.stop()
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to pause torrent: {e}")
+        return False
+
+    async def resume(self, torrent_id: str) -> bool:
+        try:
+            client = self._get_client()
+            for t in client.list():
+                if getattr(t, 'infohash', '').lower() == torrent_id.lower():
+                    t.start()
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to resume torrent: {e}")
+        return False
+
+    async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
+        try:
+            client = self._get_client()
+            for t in client.list():
+                if getattr(t, 'infohash', '').lower() == torrent_id.lower():
+                    t.remove(delete_files=delete_files)
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to remove torrent: {e}")
+        return False
 
 
 class TransmissionClient(LibTCClient):

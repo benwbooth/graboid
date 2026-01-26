@@ -73,6 +73,26 @@
             font-size: 0.875rem;
         }
 
+        nav .version {
+            color: var(--text-dim);
+            font-size: 0.75rem;
+            font-family: monospace;
+            margin-left: -0.5rem;
+        }
+
+        nav .backend-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--error);
+            margin-left: 0.5rem;
+            transition: background 0.3s;
+        }
+
+        nav .backend-status.connected {
+            background: var(--success);
+        }
+
         .status-dot {
             width: 10px;
             height: 10px;
@@ -268,6 +288,8 @@
 <body>
     <nav>
         <span class="logo">Graboid</span>
+        <span class="backend-status" id="backend-status" title="Backend disconnected"></span>
+        {% if git.hash %}<span class="version">{{ git.hash }} {{ git.timestamp }} {{ git.tz }} ({{ git.relative }})</span>{% endif %}
         <a href="/" {% if request.url.path == "/" %}class="active"{% endif %}>Dashboard</a>
         <a href="/browser" {% if request.url.path == "/browser" %}class="active"{% endif %}>Browser</a>
         <a href="/notes" {% if request.url.path == "/notes" %}class="active"{% endif %}>Notes</a>
@@ -287,6 +309,7 @@
         // WebSocket connection for live updates
         let ws = null;
         let reconnectAttempts = 0;
+        let wasConnected = false;
 
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -294,7 +317,19 @@
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
+                // Reload page if reconnecting after disconnect (server restarted)
+                if (wasConnected) {
+                    console.log('Backend restarted, reloading page...');
+                    location.reload();
+                    return;
+                }
+                wasConnected = true;
                 reconnectAttempts = 0;
+                const indicator = document.getElementById('backend-status');
+                if (indicator) {
+                    indicator.classList.add('connected');
+                    indicator.title = 'Backend connected';
+                }
             };
 
             ws.onmessage = (event) => {
@@ -304,6 +339,11 @@
 
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
+                const indicator = document.getElementById('backend-status');
+                if (indicator) {
+                    indicator.classList.remove('connected');
+                    indicator.title = 'Backend disconnected';
+                }
                 // Reconnect with exponential backoff
                 const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
                 reconnectAttempts++;

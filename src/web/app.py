@@ -26,8 +26,60 @@ logger = logging.getLogger(__name__)
 # Auth settings
 DEFAULT_USERNAME = os.environ.get("GRABOID_USERNAME", "admin")
 DEFAULT_PASSWORD = os.environ.get("GRABOID_PASSWORD", "adminadmin")
-SESSION_SECRET = os.environ.get("GRABOID_SESSION_SECRET", secrets.token_hex(32))
 SESSION_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
+# Stable session secret - use env var or derive from machine-specific data
+def _get_session_secret() -> str:
+    if secret := os.environ.get("GRABOID_SESSION_SECRET"):
+        return secret
+    # Derive stable secret from username + password hash (survives restarts)
+    import hashlib
+    stable_data = f"graboid:{DEFAULT_USERNAME}:{DEFAULT_PASSWORD}:session"
+    return hashlib.sha256(stable_data.encode()).hexdigest()
+
+SESSION_SECRET = _get_session_secret()
+
+# Git version info
+def _get_git_info() -> dict:
+    """Get git commit info for version display."""
+    import subprocess
+    from datetime import datetime, timezone
+
+    info = {"hash": "", "timestamp": "", "relative": "", "tz": ""}
+    try:
+        # Get short hash
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent
+        )
+        if result.returncode == 0:
+            info["hash"] = result.stdout.strip()
+
+        # Get commit timestamp
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent
+        )
+        if result.returncode == 0:
+            ts = int(result.stdout.strip())
+            dt = datetime.fromtimestamp(ts)
+            info["timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            info["tz"] = dt.astimezone().strftime("%Z")
+
+            # Relative time
+            now = datetime.now()
+            diff = now - dt
+            if diff.days > 0:
+                info["relative"] = f"{diff.days}d ago"
+            elif diff.seconds >= 3600:
+                info["relative"] = f"{diff.seconds // 3600}h ago"
+            else:
+                info["relative"] = f"{diff.seconds // 60}m ago"
+    except Exception:
+        pass
+    return info
+
+GIT_INFO = _get_git_info()
 
 # FastAPI app
 app = FastAPI(title="Graboid", version="0.1.0")
@@ -35,6 +87,9 @@ app = FastAPI(title="Graboid", version="0.1.0")
 # Templates
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+# Add git info to all template contexts
+templates.env.globals["git"] = GIT_INFO
 
 
 def sign_session(username: str) -> str:
@@ -248,7 +303,8 @@ async def save_config_form(
     request: Request,
     llm_provider: str = Form("claude_code"),
     llm_model: str = Form("sonnet"),
-    torrent_client: str = Form("auto"),
+    browser_mode: str = Form("chrome"),
+    torrent_client: str = Form("embedded"),
     qbittorrent_host: str = Form("localhost"),
     qbittorrent_port: int = Form(8080),
     qbittorrent_username: str = Form("admin"),
@@ -268,6 +324,7 @@ async def save_config_form(
     config_data = {
         "llm_provider": llm_provider,
         "llm_model": llm_model,
+        "browser_mode": browser_mode,
         "torrent_client": torrent_client,
         "qbittorrent_host": qbittorrent_host,
         "qbittorrent_port": qbittorrent_port,
@@ -373,33 +430,47 @@ async def get_status():
 
 @app.post("/api/test/torrent")
 async def test_torrent_connection(request: Request):
-    """Test torrent client connectivity."""
+    """Test torrent client connectivity using form values."""
     user = get_current_user(request)
     if not user:
         return {"success": False, "error": "Not authenticated"}
 
     try:
-        from ..torrent import QBittorrentClient
-        config = load_config_as_dict()
+        from ..torrent import QBittorrentClient, TransmissionClient, Aria2Client
 
-        client_type = config.get("torrent_client", "qbittorrent")
-        if client_type == "auto":
-            client_type = "qbittorrent"
+        # Get values from form body
+        form = await request.form()
+        client_type = form.get("torrent_client", "qbittorrent")
 
+        client = None
         if client_type == "qbittorrent":
             client = QBittorrentClient(
-                host=config.get("qbittorrent_host", "localhost"),
-                port=config.get("qbittorrent_port", 8080),
-                username=config.get("qbittorrent_username", "admin"),
-                password=config.get("qbittorrent_password", "adminadmin"),
+                host=form.get("qbittorrent_host", "localhost"),
+                port=int(form.get("qbittorrent_port", 8080)),
+                username=form.get("qbittorrent_username", "admin"),
+                password=form.get("qbittorrent_password", "adminadmin"),
             )
-            await client.connect()
-            torrents = await client.get_torrents()
-            await client.disconnect()
-            return {
-                "success": True,
-                "message": f"Connected to qBittorrent. {len(torrents)} active torrents.",
-            }
+        elif client_type == "transmission":
+            client = TransmissionClient(
+                host=form.get("transmission_host", "localhost"),
+                port=int(form.get("transmission_port", 9091)),
+            )
+        elif client_type == "aria2":
+            client = Aria2Client(
+                host=form.get("aria2_host", "localhost"),
+                port=int(form.get("aria2_port", 6800)),
+                secret=form.get("aria2_secret", ""),
+            )
+
+        if client:
+            if await client.is_available():
+                torrents = await client.list_torrents()
+                return {
+                    "success": True,
+                    "message": f"Connected to {client_type}. {len(torrents)} active torrents.",
+                }
+            else:
+                return {"success": False, "error": f"Could not connect to {client_type}"}
         else:
             return {"success": False, "error": f"Test not implemented for {client_type}"}
 
@@ -409,15 +480,15 @@ async def test_torrent_connection(request: Request):
 
 @app.post("/api/test/llm")
 async def test_llm_connection(request: Request):
-    """Test LLM provider connectivity."""
+    """Test LLM provider connectivity using form values."""
     user = get_current_user(request)
     if not user:
         return {"success": False, "error": "Not authenticated"}
 
     try:
-        config = load_config_as_dict()
-        provider = config.get("llm_provider", "claude_code")
-        model = config.get("llm_model", "sonnet")
+        form = await request.form()
+        provider = form.get("llm_provider", "claude_code")
+        model = form.get("llm_model", "sonnet")
 
         if provider == "claude_code":
             from ..browser.claude_code_llm import ClaudeCodeChat
@@ -433,7 +504,7 @@ async def test_llm_connection(request: Request):
 
         elif provider == "ollama":
             import httpx
-            host = config.get("ollama_host", "http://localhost:11434")
+            host = form.get("ollama_host", "http://localhost:11434")
             async with httpx.AsyncClient() as client:
                 resp = await client.get(f"{host}/api/tags", timeout=10)
                 if resp.status_code == 200:
@@ -466,6 +537,62 @@ async def test_llm_connection(request: Request):
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@app.get("/api/ollama/models")
+async def get_ollama_models(request: Request):
+    """Get available Ollama models."""
+    try:
+        import httpx
+        config = load_config_as_dict()
+        host = config.get("ollama_host", "http://localhost:11434")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{host}/api/tags", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m.get("name", "") for m in data.get("models", [])]
+                return {"models": models}
+    except Exception:
+        pass
+    return {"models": []}
+
+
+@app.get("/api/claude/models")
+async def get_claude_models(request: Request):
+    """Get available Claude models by asking Claude CLI."""
+    import asyncio
+
+    # Cache result for 1 hour
+    cache_key = "_claude_models_cache"
+    cache_time = "_claude_models_time"
+
+    now = time.time()
+    if hasattr(app.state, cache_key) and hasattr(app.state, cache_time):
+        if now - getattr(app.state, cache_time) < 3600:
+            return {"models": getattr(app.state, cache_key)}
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p",
+            "List all available Claude model IDs. Return ONLY a comma-separated list of model IDs, nothing else. Include aliases like sonnet, opus, haiku first.",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        if proc.returncode == 0:
+            text = stdout.decode().strip()
+            models = [m.strip() for m in text.split(",") if m.strip()]
+            # Cache result
+            setattr(app.state, cache_key, models)
+            setattr(app.state, cache_time, now)
+            return {"models": models}
+    except Exception as e:
+        logger.debug(f"Failed to get Claude models: {e}")
+
+    # Fallback to hardcoded list
+    fallback = ["sonnet", "opus", "haiku", "claude-opus-4-5-20251101", "claude-sonnet-4-20250514", "claude-haiku-3-5-20241022"]
+    return {"models": fallback}
 
 
 @app.get("/api/notes/stats")

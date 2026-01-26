@@ -18,13 +18,12 @@
 
             <label for="torrent_client">Client</label>
             <select name="torrent_client" id="torrent_client">
-                <option value="auto" {% if config.get('torrent_client') == 'auto' %}selected{% endif %}>Auto-detect</option>
+                <option value="embedded" {% if config.get('torrent_client', 'embedded') == 'embedded' %}selected{% endif %}>Embedded (libtorrent)</option>
                 <option value="qbittorrent" {% if config.get('torrent_client') == 'qbittorrent' %}selected{% endif %}>qBittorrent</option>
                 <option value="transmission" {% if config.get('torrent_client') == 'transmission' %}selected{% endif %}>Transmission</option>
                 <option value="deluge" {% if config.get('torrent_client') == 'deluge' %}selected{% endif %}>Deluge</option>
                 <option value="rtorrent" {% if config.get('torrent_client') == 'rtorrent' %}selected{% endif %}>rTorrent</option>
                 <option value="aria2" {% if config.get('torrent_client') == 'aria2' %}selected{% endif %}>aria2</option>
-                <option value="embedded" {% if config.get('torrent_client') == 'embedded' %}selected{% endif %}>Embedded (libtorrent)</option>
             </select>
 
             <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">qBittorrent Settings</h3>
@@ -65,14 +64,29 @@
             </select>
 
             <label for="llm_model">Model</label>
-            <input type="text" name="llm_model" id="llm_model"
+            <input type="text" name="llm_model" id="llm_model" list="model-list"
                    value="{{ config.get('llm_model', 'sonnet') }}"
                    placeholder="sonnet, opus, gpt-4o, llama3.2, etc.">
+            <datalist id="model-list"></datalist>
 
             <button type="button" class="secondary" id="test-llm" style="margin-top: 0.5rem;">
                 Test Connection
             </button>
             <div id="llm-result" style="margin-top: 0.5rem; font-size: 0.875rem;"></div>
+
+            <h2 style="margin-top: 1.5rem;">Browser</h2>
+
+            <label for="browser_mode">Browser Mode</label>
+            <select name="browser_mode" id="browser_mode">
+                <option value="chrome" {% if config.get('browser_mode', 'chrome') == 'chrome' %}selected{% endif %}>Claude Chrome Integration</option>
+                <option value="browser_use" {% if config.get('browser_mode') == 'browser_use' %}selected{% endif %}>browser-use (Playwright)</option>
+            </select>
+
+            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; margin-top: 0.5rem;">
+                <input type="checkbox" name="headless" id="headless" style="width: auto;"
+                       {% if config.get('headless', True) %}checked{% endif %}>
+                <span>Headless mode (use Xvfb for Chrome)</span>
+            </label>
 
             <h2 style="margin-top: 1.5rem;">Paths</h2>
 
@@ -83,14 +97,6 @@
             <label for="path_mappings">Path Mappings (one per line, host:container)</label>
             <textarea name="path_mappings" id="path_mappings" rows="4"
                       placeholder="/mnt/downloads:/downloads">{{ config.get('path_mappings', []) | join('\n') }}</textarea>
-
-            <h2 style="margin-top: 1.5rem;">Browser</h2>
-
-            <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
-                <input type="checkbox" name="headless" id="headless" style="width: auto;"
-                       {% if config.get('headless', True) %}checked{% endif %}>
-                <span>Run browser in headless mode</span>
-            </label>
 
             <h2 style="margin-top: 1.5rem;">Logging</h2>
 
@@ -119,7 +125,7 @@
 
 {% block scripts %}
 <script>
-async function testConnection(endpoint, resultId, buttonId) {
+async function testConnection(endpoint, resultId, buttonId, formData) {
     const btn = document.getElementById(buttonId);
     const result = document.getElementById(resultId);
 
@@ -128,7 +134,10 @@ async function testConnection(endpoint, resultId, buttonId) {
     result.innerHTML = '<span style="color: var(--text-dim);">Testing connection...</span>';
 
     try {
-        const resp = await fetch(endpoint, { method: 'POST' });
+        const resp = await fetch(endpoint, {
+            method: 'POST',
+            body: formData
+        });
         const data = await resp.json();
 
         if (data.success) {
@@ -145,11 +154,78 @@ async function testConnection(endpoint, resultId, buttonId) {
 }
 
 document.getElementById('test-torrent').addEventListener('click', () => {
-    testConnection('/api/test/torrent', 'torrent-result', 'test-torrent');
+    const form = document.querySelector('form');
+    const formData = new FormData(form);
+    testConnection('/api/test/torrent', 'torrent-result', 'test-torrent', formData);
 });
 
 document.getElementById('test-llm').addEventListener('click', () => {
-    testConnection('/api/test/llm', 'llm-result', 'test-llm');
+    const form = document.querySelector('form');
+    const formData = new FormData(form);
+    testConnection('/api/test/llm', 'llm-result', 'test-llm', formData);
 });
+
+// Model autocomplete based on provider
+const staticModelLists = {
+    openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'o1', 'o1-mini', 'o3-mini'],
+    google: ['gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+    openrouter: ['anthropic/claude-3.5-sonnet', 'openai/gpt-4o', 'google/gemini-pro'],
+};
+
+function updateModelList(provider) {
+    const datalist = document.getElementById('model-list');
+    datalist.innerHTML = '';
+
+    // Static lists for some providers
+    if (staticModelLists[provider]) {
+        staticModelLists[provider].forEach(model => {
+            const option = document.createElement('option');
+            option.value = model;
+            datalist.appendChild(option);
+        });
+        return;
+    }
+
+    // Fetch dynamically for Ollama
+    if (provider === 'ollama') {
+        fetch('/api/ollama/models')
+            .then(r => r.json())
+            .then(data => {
+                if (data.models) {
+                    data.models.forEach(model => {
+                        const option = document.createElement('option');
+                        option.value = model;
+                        datalist.appendChild(option);
+                    });
+                }
+            })
+            .catch(() => {});
+        return;
+    }
+
+    // Fetch dynamically for Claude (claude_code and anthropic)
+    if (provider === 'claude_code' || provider === 'anthropic') {
+        fetch('/api/claude/models')
+            .then(r => r.json())
+            .then(data => {
+                if (data.models) {
+                    data.models.forEach(model => {
+                        const option = document.createElement('option');
+                        option.value = model;
+                        datalist.appendChild(option);
+                    });
+                }
+            })
+            .catch(() => {});
+    }
+}
+
+// Update on provider change
+document.getElementById('llm_provider').addEventListener('change', (e) => {
+    updateModelList(e.target.value);
+});
+
+// Initial load
+updateModelList(document.getElementById('llm_provider').value);
 </script>
 {% endblock %}

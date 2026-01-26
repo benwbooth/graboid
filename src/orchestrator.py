@@ -79,11 +79,12 @@ class Config(BaseSettings):
     prefer_local_llm: bool = False
 
     # Browser settings
+    browser_mode: str = "chrome"  # chrome (Claude integration) or browser_use (Playwright)
     headless: bool = True
     max_navigation_steps: int = 15
 
     # Torrent settings
-    torrent_client: str = "auto"
+    torrent_client: str = "embedded"
     max_concurrent_torrents: int = 3
 
     # qBittorrent settings
