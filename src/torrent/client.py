@@ -54,6 +54,33 @@ class TorrentStatus:
     save_path: Path
 
 
+class FilePriority(int, Enum):
+    """File download priority levels."""
+
+    SKIP = 0  # Don't download
+    LOW = 1
+    NORMAL = 4
+    HIGH = 7
+
+
+@dataclass
+class TorrentFile:
+    """Information about a file within a torrent."""
+
+    index: int  # File index within torrent
+    name: str  # File name
+    path: str  # Full path within torrent
+    size: int  # Size in bytes
+    progress: float  # Download progress 0.0 to 1.0
+    priority: FilePriority  # Download priority
+    downloaded: int = 0  # Bytes downloaded
+
+    @property
+    def is_selected(self) -> bool:
+        """Check if file is selected for download."""
+        return self.priority != FilePriority.SKIP
+
+
 class TorrentClient(ABC):
     """Abstract base class for torrent clients."""
 
@@ -107,6 +134,98 @@ class TorrentClient(ABC):
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
         """Remove a torrent, optionally deleting files."""
         ...
+
+    async def list_files(self, torrent_id: str) -> list[TorrentFile]:
+        """List files within a torrent.
+
+        Args:
+            torrent_id: Torrent hash/ID
+
+        Returns:
+            List of TorrentFile objects
+
+        Note: Not all clients support this. Default returns empty list.
+        """
+        return []
+
+    async def set_file_priority(
+        self,
+        torrent_id: str,
+        file_indices: list[int],
+        priority: FilePriority,
+    ) -> bool:
+        """Set download priority for specific files.
+
+        Args:
+            torrent_id: Torrent hash/ID
+            file_indices: List of file indices to update
+            priority: Priority level (SKIP to not download)
+
+        Returns:
+            True if successful
+
+        Note: Not all clients support this. Default returns False.
+        """
+        return False
+
+    async def select_files(
+        self,
+        torrent_id: str,
+        patterns: list[str] | None = None,
+        extensions: list[str] | None = None,
+    ) -> int:
+        """Select files to download based on patterns or extensions.
+
+        Args:
+            torrent_id: Torrent hash/ID
+            patterns: Glob patterns to match (e.g., ["*.mkv", "*.mp4"])
+            extensions: File extensions to include (e.g., ["mkv", "mp4"])
+
+        Returns:
+            Number of files selected
+
+        Note: Sets non-matching files to SKIP priority.
+        """
+        import fnmatch
+
+        files = await self.list_files(torrent_id)
+        if not files:
+            return 0
+
+        selected = []
+        skipped = []
+
+        for f in files:
+            matches = False
+
+            if patterns:
+                for pattern in patterns:
+                    if fnmatch.fnmatch(f.name, pattern) or fnmatch.fnmatch(f.path, pattern):
+                        matches = True
+                        break
+
+            if extensions and not matches:
+                ext = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+                if ext in [e.lower().lstrip(".") for e in extensions]:
+                    matches = True
+
+            if not patterns and not extensions:
+                matches = True
+
+            if matches:
+                selected.append(f.index)
+            else:
+                skipped.append(f.index)
+
+        # Skip non-matching files
+        if skipped:
+            await self.set_file_priority(torrent_id, skipped, FilePriority.SKIP)
+
+        # Ensure selected files are normal priority
+        if selected:
+            await self.set_file_priority(torrent_id, selected, FilePriority.NORMAL)
+
+        return len(selected)
 
     def _extract_hash_from_magnet(self, magnet: str) -> str:
         """Extract info hash from magnet link."""
@@ -471,6 +590,53 @@ class QBittorrentClient(TorrentClient):
                     return True
         except Exception as e:
             logger.error(f"Failed to remove torrent: {e}")
+        return False
+
+    async def list_files(self, torrent_id: str) -> list[TorrentFile]:
+        """List files in a torrent (qBittorrent specific)."""
+        try:
+            client = self._get_client()
+            for t in client.list():
+                if getattr(t, 'infohash', '').lower() == torrent_id.lower():
+                    files = []
+                    # Access qBittorrent's files API
+                    raw_client = getattr(client, '_client', None)
+                    if raw_client and hasattr(raw_client, 'torrents_files'):
+                        file_list = raw_client.torrents_files(torrent_id)
+                        for i, f in enumerate(file_list):
+                            files.append(TorrentFile(
+                                index=i,
+                                name=Path(f.get('name', '')).name,
+                                path=f.get('name', ''),
+                                size=f.get('size', 0),
+                                progress=f.get('progress', 0),
+                                priority=FilePriority(f.get('priority', 4)),
+                                downloaded=int(f.get('progress', 0) * f.get('size', 0)),
+                            ))
+                    return files
+        except Exception as e:
+            logger.debug(f"Failed to list torrent files: {e}")
+        return []
+
+    async def set_file_priority(
+        self,
+        torrent_id: str,
+        file_indices: list[int],
+        priority: FilePriority,
+    ) -> bool:
+        """Set file priority (qBittorrent specific)."""
+        try:
+            client = self._get_client()
+            raw_client = getattr(client, '_client', None)
+            if raw_client and hasattr(raw_client, 'torrents_file_priority'):
+                raw_client.torrents_file_priority(
+                    torrent_id,
+                    file_ids=file_indices,
+                    priority=priority.value,
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Failed to set file priority: {e}")
         return False
 
 

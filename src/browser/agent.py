@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel
 
@@ -52,6 +52,7 @@ class NavigationResult:
     error: str | None = None
     final_url: str | None = None
     history: Any = None  # AgentHistoryList from browser-use
+    screenshots: list[tuple[bytes, str, str]] = field(default_factory=list)  # (data, url, description)
 
 
 def get_llm(
@@ -198,6 +199,9 @@ def get_llm(
         raise ValueError(f"Unknown provider: {provider}")
 
 
+ScreenshotCallback = Callable[[bytes, str, str], Any]  # (data, url, description)
+
+
 class BrowserAgent:
     """
     Browser automation agent using browser-use for LLM-driven navigation.
@@ -218,6 +222,7 @@ class BrowserAgent:
         headless: bool = True,
         use_vision: bool = True,
         notes_db: NotesDB | None = None,
+        screenshot_callback: ScreenshotCallback | None = None,
     ):
         """
         Initialize browser agent.
@@ -230,6 +235,7 @@ class BrowserAgent:
             headless: Run browser without GUI
             use_vision: Send screenshots to LLM (recommended True)
             notes_db: Database for storing/retrieving navigation notes
+            screenshot_callback: Optional callback for screenshots (data, url, description)
         """
         self.llm_provider = llm_provider
         self.llm_model = llm_model
@@ -238,9 +244,14 @@ class BrowserAgent:
         self.headless = headless
         self.use_vision = use_vision
         self.notes_db = notes_db or get_notes_db()
+        self._screenshot_callback = screenshot_callback
 
         self._llm = None
         self._browser = None
+
+    def set_screenshot_callback(self, callback: ScreenshotCallback | None) -> None:
+        """Set or clear the screenshot callback."""
+        self._screenshot_callback = callback
 
     def _get_llm(self):
         """Lazy-load LLM instance."""
@@ -253,15 +264,90 @@ class BrowserAgent:
         return self._llm
 
     async def _get_browser(self):
-        """Lazy-load browser instance."""
+        """Lazy-load browser instance, using system Chrome if available."""
         if self._browser is None:
-            from browser_use import Browser
+            from browser_use.browser.session import BrowserSession
 
-            self._browser = Browser(
+            # Find system Chrome/Chromium (needed for NixOS and similar)
+            chrome_path = self._find_system_chrome()
+            logger.info(f"Creating browser session (headless={self.headless}, chrome_path={chrome_path})")
+
+            self._browser = BrowserSession(
                 headless=self.headless,
                 disable_security=True,  # Needed for some ROM sites
+                executable_path=chrome_path,  # Use system Chrome if found
             )
+
+            # Start the browser session (required for browser-use 0.11.x)
+            logger.info("Starting browser session...")
+            await self._browser.start()
+            logger.info("Browser session started successfully")
+
         return self._browser
+
+    def _find_system_chrome(self) -> str | None:
+        """Find system-installed Chrome/Chromium binary."""
+        import shutil
+
+        # Common Chrome/Chromium binary names
+        candidates = [
+            "google-chrome-stable",
+            "google-chrome",
+            "chromium-browser",
+            "chromium",
+            "chrome",
+        ]
+
+        for name in candidates:
+            path = shutil.which(name)
+            if path:
+                logger.info(f"Using system Chrome: {path}")
+                return path
+
+        return None
+
+    async def _ensure_browser_installed(self):
+        """Install Playwright browser if not already installed."""
+        import os
+        import subprocess
+        import sys
+
+        # Clean environment - remove askpass programs that cause GUI popups
+        clean_env = {k: v for k, v in os.environ.items()
+                     if k not in ("SSH_ASKPASS", "SUDO_ASKPASS", "GIT_ASKPASS", "SSH_AUTH_SOCK")}
+        clean_env["GIT_TERMINAL_PROMPT"] = "0"
+
+        # Check if chromium is installed by looking for the browser path
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"],
+                capture_output=True,
+                text=True,
+                env=clean_env,
+            )
+            # If dry-run succeeds without "is not installed" message, browser exists
+            if "is not installed" not in result.stdout and "is not installed" not in result.stderr:
+                return
+        except Exception:
+            pass
+
+        # Install chromium browser
+        logger.info("Installing Chromium browser for Playwright (first-time setup)...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "playwright", "install", "chromium",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=clean_env,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode == 0:
+                logger.info("Chromium browser installed successfully")
+            else:
+                logger.warning(f"Browser install returned {proc.returncode}: {stderr.decode()}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-install browser: {e}")
 
     async def navigate_to_roms(
         self,
@@ -292,8 +378,48 @@ class BrowserAgent:
         # Build task prompt for browser-use agent
         task = self._build_task_prompt(target)
 
-        logger.info(f"Starting browser navigation: {target.platform}")
+        logger.info(f"Starting browser navigation: {target.url}")
         logger.debug(f"Task: {task}")
+
+        screenshots: list[tuple[bytes, str, str]] = []
+        screenshot_stop = asyncio.Event()
+
+        async def capture_screenshots():
+            """Background task to capture screenshots periodically."""
+            last_screenshot = None
+            step_count = 0
+            while not screenshot_stop.is_set():
+                try:
+                    # Get the current page from the browser context
+                    if browser._context and browser._context.pages:
+                        page = browser._context.pages[-1]
+                        url = page.url
+                        screenshot_data = await page.screenshot()
+
+                        # Only save if screenshot changed (simple comparison)
+                        if screenshot_data != last_screenshot:
+                            last_screenshot = screenshot_data
+                            step_count += 1
+                            description = f"Step {step_count}: Viewing {url}"
+                            screenshots.append((screenshot_data, url, description))
+
+                            # Call callback if set
+                            if self._screenshot_callback:
+                                try:
+                                    result = self._screenshot_callback(screenshot_data, url, description)
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                                except Exception as e:
+                                    logger.warning(f"Screenshot callback error: {e}")
+                except Exception as e:
+                    logger.debug(f"Screenshot capture error: {e}")
+
+                # Wait before next capture
+                try:
+                    await asyncio.wait_for(screenshot_stop.wait(), timeout=2.0)
+                    break  # Event was set
+                except asyncio.TimeoutError:
+                    pass  # Continue capturing
 
         try:
             agent = Agent(
@@ -306,17 +432,28 @@ class BrowserAgent:
                 extend_system_message=self._get_system_extension(),
             )
 
-            # Run the agent - browser-use handles everything
-            history = await agent.run(max_steps=max_steps)
+            # Start screenshot capture task
+            screenshot_task = asyncio.create_task(capture_screenshots())
+
+            try:
+                # Run the agent - browser-use handles everything
+                history = await agent.run(max_steps=max_steps)
+            finally:
+                # Stop screenshot capture
+                screenshot_stop.set()
+                await screenshot_task
 
             # Extract results from history
-            return self._process_history(history, target)
+            result = self._process_history(history, target)
+            result.screenshots = screenshots
+            return result
 
         except Exception as e:
             logger.error(f"Navigation failed: {e}")
             return NavigationResult(
                 success=False,
                 error=str(e),
+                screenshots=screenshots,
             )
 
     def _build_task_prompt(self, target: NavigationTarget) -> str:
@@ -455,7 +592,7 @@ Report full URLs when you find downloads. Include file sizes if visible.
                     url_or_domain=target.url,
                     note_type=note_type,  # type: ignore
                     content=content,
-                    platform=target.platform,
+                    platform=None,  # Platform not tracked for general navigation
                     success=note_success,
                 )
                 logger.debug(f"Saved learning: {note_type} - {content[:50]}...")
@@ -482,27 +619,26 @@ Report full URLs when you find downloads. Include file sizes if visible.
     async def find_download_links(
         self,
         url: str,
-        platform: str,
+        description: str = "",
         max_steps: int = 30,
-    ) -> list[str]:
+    ) -> NavigationResult:
         """
-        Convenience method to find download links on a page.
+        Find download links on a page.
 
         Args:
             url: Page URL to scan
-            platform: Platform name for context
+            description: Task description for the agent
             max_steps: Maximum steps
 
         Returns:
-            List of download URLs found
+            NavigationResult with found links and screenshots
         """
         target = NavigationTarget(
             url=url,
-            platform=platform,
+            description=description or "Find download links",
             source_type="unknown",
         )
-        result = await self.navigate_to_roms(target, max_steps=max_steps)
-        return result.found_links
+        return await self.navigate_to_roms(target, max_steps=max_steps)
 
     async def close(self):
         """Close browser and cleanup."""

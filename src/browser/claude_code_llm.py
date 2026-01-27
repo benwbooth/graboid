@@ -12,6 +12,14 @@ from typing import Any, AsyncIterator, Iterator
 
 logger = logging.getLogger(__name__)
 
+# Try to import LangChain message types for proper type checking
+try:
+    from langchain_core.messages import BaseMessage
+    HAS_LANGCHAIN = True
+except ImportError:
+    HAS_LANGCHAIN = False
+    BaseMessage = None
+
 
 class ClaudeCodeChat:
     """
@@ -36,8 +44,10 @@ class ClaudeCodeChat:
             max_tokens: Max tokens for response (informational, CLI handles this)
         """
         self.model = model
+        self.model_name = model  # Required by browser-use
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.provider = "claude_code"  # Required by browser-use
         self._temp_dir = Path(tempfile.gettempdir()) / "graboid_screenshots"
         self._temp_dir.mkdir(exist_ok=True)
 
@@ -55,9 +65,11 @@ class ClaudeCodeChat:
         except Exception:
             pass
 
-    def _extract_images_and_text(self, messages: list[dict]) -> tuple[str, list[Path]]:
+    def _extract_images_and_text(self, messages: list) -> tuple[str, list[Path]]:
         """
         Extract text and images from messages.
+
+        Handles both dict messages and LangChain message objects.
 
         Returns:
             Tuple of (combined text prompt, list of image paths)
@@ -66,8 +78,19 @@ class ClaudeCodeChat:
         image_paths = []
 
         for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
+            # Handle both dict and LangChain message objects
+            # Check for LangChain BaseMessage first (more reliable than hasattr)
+            if HAS_LANGCHAIN and BaseMessage is not None and isinstance(msg, BaseMessage):
+                # LangChain message object
+                role = msg.type  # 'system', 'human', 'ai'
+                content = msg.content
+            elif isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+            else:
+                # Fallback: try to access .type and .content attributes
+                role = getattr(msg, 'type', 'user')
+                content = getattr(msg, 'content', str(msg))
 
             if isinstance(content, str):
                 text_parts.append(f"[{role}]: {content}")
@@ -97,27 +120,49 @@ class ClaudeCodeChat:
 
         return "\n\n".join(text_parts), image_paths
 
-    def _build_prompt(self, text: str, image_paths: list[Path]) -> str:
+    def _build_prompt(self, text: str, image_paths: list[Path], output_format: Any = None) -> str:
         """Build the prompt for Claude CLI."""
-        if not image_paths:
-            return text
+        parts = []
 
-        # Include instructions to read images
-        image_instructions = []
-        for i, path in enumerate(image_paths, 1):
-            image_instructions.append(f"Image {i}: Read and analyze the image at {path}")
+        if image_paths:
+            # Include instructions to read images
+            image_instructions = []
+            for i, path in enumerate(image_paths, 1):
+                image_instructions.append(f"Image {i}: Read and analyze the image at {path}")
+            parts.append(f"IMAGES TO ANALYZE:\n{chr(10).join(image_instructions)}")
+            parts.append("IMPORTANT: Use the Read tool to view each image file listed above before responding.")
 
-        return f"""You are a browser automation assistant. Analyze the following conversation and images to decide what action to take.
+        parts.append(f"CONVERSATION:\n{text}")
 
-IMAGES TO ANALYZE:
-{chr(10).join(image_instructions)}
+        # If output_format is provided, include JSON schema instructions
+        if output_format is not None:
+            try:
+                schema = output_format.model_json_schema()
+                schema_str = json.dumps(schema, indent=2)
+                parts.append(f"""
+IMPORTANT: You MUST respond with ONLY valid JSON matching this schema:
+{schema_str}
 
-IMPORTANT: Use the Read tool to view each image file listed above before responding.
+Required fields: evaluation_previous_goal, memory, next_goal, action
 
-CONVERSATION:
-{text}
+The 'action' field must be a list with at least one action object. Each action should have exactly ONE action type.
+Common action types: go_to_url, click_element, input_text, scroll_down, scroll_up, done
 
-Based on the screenshots and conversation, decide the next browser action. Respond with your analysis and the action to take."""
+Example response format:
+{{
+  "evaluation_previous_goal": "Evaluating what happened after the last action",
+  "memory": "Key information to remember",
+  "next_goal": "What I will do next",
+  "action": [
+    {{"go_to_url": {{"url": "https://example.com"}}}}
+  ]
+}}
+
+Respond with ONLY the JSON object, no other text or markdown.""")
+            except Exception as e:
+                logger.warning(f"Could not get JSON schema: {e}")
+
+        return "\n\n".join(parts)
 
     async def _call_claude_cli(self, prompt: str, image_paths: list[Path]) -> str:
         """Call claude CLI and return response."""
@@ -159,40 +204,88 @@ Based on the screenshots and conversation, decide the next browser action. Respo
             logger.error(f"Claude CLI timeout after {self.timeout}s")
             raise RuntimeError(f"Claude CLI timeout after {self.timeout}s")
 
-    async def ainvoke(self, messages: list[dict], **kwargs) -> "AIMessage":
+    def _extract_json(self, text: str) -> str:
+        """Extract JSON from response text, handling markdown code blocks."""
+        text = text.strip()
+        # Try to extract from markdown code blocks
+        if "```json" in text:
+            start = text.find("```json") + 7
+            end = text.find("```", start)
+            if end > start:
+                text = text[start:end].strip()
+        elif "```" in text:
+            start = text.find("```") + 3
+            end = text.find("```", start)
+            if end > start:
+                text = text[start:end].strip()
+        # Find JSON object boundaries
+        if text.startswith("{"):
+            # Find matching closing brace
+            depth = 0
+            for i, c in enumerate(text):
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[:i+1]
+        return text
+
+    async def ainvoke(self, messages: list[dict], *args, **kwargs) -> "AIMessage":
         """
         Async invoke - main entry point for browser-use.
 
         Args:
             messages: List of message dicts with role and content
-            **kwargs: Additional arguments (ignored)
+            *args: Additional positional arguments (ignored)
+            **kwargs: Additional keyword arguments including output_format
 
         Returns:
-            AIMessage-like object with content
+            AIMessage-like object with content and completion
         """
+        output_format = kwargs.get("output_format")
         text, image_paths = self._extract_images_and_text(messages)
-        prompt = self._build_prompt(text, image_paths)
+        prompt = self._build_prompt(text, image_paths, output_format)
 
         try:
             response = await self._call_claude_cli(prompt, image_paths)
-            return AIMessage(content=response)
+
+            # Try to parse structured output if output_format is provided
+            completion = None
+            if output_format is not None:
+                logger.info(f"Attempting to parse response into {output_format.__name__}")
+                logger.info(f"Raw response (first 1000 chars): {response[:1000]}")
+                try:
+                    json_str = self._extract_json(response)
+                    logger.info(f"Extracted JSON (first 500 chars): {json_str[:500]}")
+                    data = json.loads(json_str)
+                    completion = output_format.model_validate(data)
+                    logger.info(f"Successfully parsed response into {output_format.__name__}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON from response: {e}")
+                    logger.error(f"Response was: {response[:1000]}")
+                except Exception as e:
+                    logger.error(f"Failed to validate response against schema: {e}")
+                    logger.error(f"JSON data: {json_str[:1000] if 'json_str' in dir() else 'N/A'}")
+
+            return AIMessage(content=response, completion=completion)
         finally:
             # Cleanup temp images
             for path in image_paths:
                 self._cleanup_image(path)
 
-    def invoke(self, messages: list[dict], **kwargs) -> "AIMessage":
+    def invoke(self, messages: list[dict], *args, **kwargs) -> "AIMessage":
         """Sync invoke - runs async version."""
-        return asyncio.run(self.ainvoke(messages, **kwargs))
+        return asyncio.run(self.ainvoke(messages, *args, **kwargs))
 
-    async def astream(self, messages: list[dict], **kwargs) -> AsyncIterator["AIMessage"]:
+    async def astream(self, messages: list[dict], *args, **kwargs) -> AsyncIterator["AIMessage"]:
         """Async stream - browser-use may use this."""
-        result = await self.ainvoke(messages, **kwargs)
+        result = await self.ainvoke(messages, *args, **kwargs)
         yield result
 
-    def stream(self, messages: list[dict], **kwargs) -> Iterator["AIMessage"]:
+    def stream(self, messages: list[dict], *args, **kwargs) -> Iterator["AIMessage"]:
         """Sync stream."""
-        result = self.invoke(messages, **kwargs)
+        result = self.invoke(messages, *args, **kwargs)
         yield result
 
     def bind_tools(self, tools: list[Any], **kwargs) -> "ClaudeCodeChat":
@@ -208,10 +301,29 @@ Based on the screenshots and conversation, decide the next browser action. Respo
 class AIMessage:
     """Simple message class to match LangChain interface."""
 
-    def __init__(self, content: str, tool_calls: list | None = None):
+    def __init__(self, content: str, tool_calls: list | None = None, completion: Any = None):
         self.content = content
         self.tool_calls = tool_calls or []
         self.additional_kwargs = {}
+        self.response_metadata = {}  # LangChain compatibility
+        self.id = None  # Message ID
+        self.completion = completion  # Parsed structured output for browser-use
+        # Mock usage stats as dict (browser-use/pydantic expects specific fields)
+        output_tokens = len(content.split()) * 2  # Rough estimate
+        self.usage_metadata = {
+            'input_tokens': 0,
+            'output_tokens': output_tokens,
+            'total_tokens': output_tokens,
+        }
+        # browser-use expects these exact fields for TokenUsageEntry
+        self.usage = {
+            'prompt_tokens': 0,
+            'prompt_cached_tokens': 0,
+            'prompt_cache_creation_tokens': 0,
+            'prompt_image_tokens': 0,
+            'completion_tokens': output_tokens,
+            'total_tokens': output_tokens,
+        }
 
     def __str__(self) -> str:
         return self.content

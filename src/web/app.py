@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -12,14 +13,48 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Remove askpass programs from environment to prevent GUI credential popups
+for _askpass_var in ("SSH_ASKPASS", "SUDO_ASKPASS", "GIT_ASKPASS"):
+    os.environ.pop(_askpass_var, None)
+os.environ["GIT_TERMINAL_PROMPT"] = "0"
+
+# In-memory log buffer for UI
+LOG_BUFFER_SIZE = 500
+log_buffer: collections.deque = collections.deque(maxlen=LOG_BUFFER_SIZE)
+
+
+class BufferingLogHandler(logging.Handler):
+    """Log handler that keeps recent logs in memory for UI display."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            log_buffer.append({
+                "time": record.created,
+                "level": record.levelname,
+                "name": record.name,
+                "message": msg,
+            })
+        except Exception:
+            pass
+
+
+# Install the buffering handler on root logger
+_buffer_handler = BufferingLogHandler()
+_buffer_handler.setLevel(logging.INFO)
+_buffer_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(name)s] %(message)s'))
+logging.getLogger().addHandler(_buffer_handler)
+
 import tomllib
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from platformdirs import user_cache_dir
 
 from ..browser import get_notes_db
 from ..orchestrator import Config, CONFIG_SEARCH_PATHS, EXAMPLE_CONFIG
+from .api import router as api_router, generate_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -41,40 +76,64 @@ SESSION_SECRET = _get_session_secret()
 
 # Git version info
 def _get_git_info() -> dict:
-    """Get git commit info for version display."""
+    """Get git hash and file modification time for version display."""
     import subprocess
-    from datetime import datetime, timezone
+    from datetime import datetime
 
+    repo_root = Path(__file__).parent.parent.parent
     info = {"hash": "", "timestamp": "", "relative": "", "tz": ""}
+
+    # Set GIT_SSH_COMMAND to prevent any SSH operations
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "false"}
+
     try:
-        # Get short hash
+        # Get short hash (local only, no network)
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent
+            capture_output=True, text=True, cwd=repo_root, env=env, timeout=5
         )
         if result.returncode == 0:
             info["hash"] = result.stdout.strip()
 
-        # Get commit timestamp
+        # Check for uncommitted changes (local only)
         result = subprocess.run(
-            ["git", "log", "-1", "--format=%ct"],
-            capture_output=True, text=True, cwd=Path(__file__).parent.parent.parent
+            ["git", "status", "--porcelain", "-uno"],  # -uno: don't check untracked
+            capture_output=True, text=True, cwd=repo_root, env=env, timeout=5
         )
-        if result.returncode == 0:
-            ts = int(result.stdout.strip())
-            dt = datetime.fromtimestamp(ts)
-            info["timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-            info["tz"] = dt.astimezone().strftime("%Z")
+        has_changes = result.returncode == 0 and result.stdout.strip()
 
-            # Relative time
-            now = datetime.now()
-            diff = now - dt
-            if diff.days > 0:
-                info["relative"] = f"{diff.days}d ago"
-            elif diff.seconds >= 3600:
-                info["relative"] = f"{diff.seconds // 3600}h ago"
+        if has_changes:
+            info["hash"] += "*"
+
+        # Get timestamp of most recent commit or file
+        # Just use current time for simplicity if there are changes
+        if has_changes:
+            dt = datetime.now()
+        else:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ct"],
+                capture_output=True, text=True, cwd=repo_root, env=env, timeout=5
+            )
+            if result.returncode == 0:
+                ts = int(result.stdout.strip())
+                dt = datetime.fromtimestamp(ts)
             else:
-                info["relative"] = f"{diff.seconds // 60}m ago"
+                dt = datetime.now()
+
+        info["timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        info["tz"] = dt.astimezone().strftime("%Z")
+
+        # Calculate relative time
+        now = datetime.now()
+        diff = now - dt
+        if diff.days > 0:
+            info["relative"] = f"{diff.days}d ago"
+        elif diff.seconds >= 3600:
+            info["relative"] = f"{diff.seconds // 3600}h ago"
+        elif diff.seconds >= 60:
+            info["relative"] = f"{diff.seconds // 60}m ago"
+        else:
+            info["relative"] = "just now"
     except Exception:
         pass
     return info
@@ -84,12 +143,131 @@ GIT_INFO = _get_git_info()
 # FastAPI app
 app = FastAPI(title="Graboid", version="0.1.0")
 
+# Include API router
+app.include_router(api_router)
+
 # Templates
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
 
 # Add git info to all template contexts
 templates.env.globals["git"] = GIT_INFO
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize job queue, runner, and credential store on startup."""
+    from platformdirs import user_data_dir
+
+    # Credential store disabled - was causing GUI password prompts
+    # To re-enable, uncomment and set GRABOID_USE_KEYRING=1
+    # try:
+    #     from ..credentials import CredentialStore
+    #     state.credential_store = CredentialStore()
+    # except Exception as e:
+    #     logger.warning(f"Failed to initialize credential store: {e}")
+    state.credential_store = None
+
+    # Initialize job queue
+    try:
+        from ..jobs import JobDatabase, JobQueue
+
+        data_dir = Path(user_data_dir("graboid", "graboid"))
+        db_path = data_dir / "jobs.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        db = JobDatabase(db_path)
+        await db.connect()
+
+        state.job_queue = JobQueue(
+            db=db,
+            max_concurrent=1,
+            on_job_update=_on_job_update,
+            on_screenshot=_on_screenshot,
+        )
+
+        logger.info(f"Job queue initialized at {db_path}")
+    except Exception as e:
+        logger.warning(f"Failed to initialize job queue: {e}")
+
+    # Initialize and start job runner
+    try:
+        from ..jobs import JobRunner
+        from ..orchestrator import Config, Graboid
+
+        config = Config()
+        graboid = Graboid(config)
+
+        state.job_runner = JobRunner(
+            queue=state.job_queue,
+            graboid=graboid,
+            config=config,
+            on_screenshot=_runner_screenshot_callback,
+        )
+        await state.job_runner.start()
+        logger.info("Job runner started")
+    except Exception as e:
+        logger.warning(f"Failed to start job runner: {e}")
+
+    # Load or generate API key
+    config_dict = load_config_as_dict()
+    api_key = config_dict.get("api", {}).get("api_key", "")
+    if not api_key:
+        api_key = os.environ.get("GRABOID_API_KEY", "")
+    if not api_key:
+        api_key = generate_api_key()
+        logger.info("Generated new API key (set GRABOID_API_KEY env var to persist)")
+    state.api_key = api_key
+
+    # Make state accessible via app.state for API routes
+    app.state.job_queue = state.job_queue
+    app.state.credential_store = state.credential_store
+    app.state.api_key = state.api_key
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up on shutdown."""
+    if state.job_runner:
+        await state.job_runner.stop()
+    if state.job_queue:
+        await state.job_queue.shutdown()
+        await state.job_queue.db.close()
+
+
+async def _on_job_update(job):
+    """Callback when a job is updated."""
+    await state.broadcast({
+        "type": "job_update",
+        "job_id": job.id,
+        "status": job.status.value,
+        "progress": job.progress_percent,
+        "message": job.progress_message,
+    })
+
+
+async def _on_screenshot(screenshot):
+    """Callback when a screenshot is added to the database."""
+    await state.broadcast({
+        "type": "job_screenshot",
+        "job_id": screenshot.job_id,
+        "url": screenshot.url,
+        "phase": screenshot.phase,
+    })
+
+
+async def _runner_screenshot_callback(job_id: str, screenshot_data: bytes, url: str):
+    """Callback from job runner when a screenshot is captured.
+
+    Note: Screenshot is already saved to DB by the runner via queue.add_screenshot.
+    This callback just broadcasts to websockets for real-time updates.
+    """
+    await state.broadcast({
+        "type": "job_screenshot",
+        "job_id": job_id,
+        "url": url,
+        "has_data": True,
+    })
 
 
 def sign_session(username: str) -> str:
@@ -148,6 +326,11 @@ class AppState:
         self.websockets: list[WebSocket] = []
         self.config: Config | None = None
         self.config_path: Path | None = None
+        self.api_key: str = ""
+        self.job_queue = None  # Initialized in startup
+        self.job_runner = None  # Initialized in startup
+        self.credential_store = None  # Initialized in startup
+        self.graboid = None  # Initialized in startup
 
     async def broadcast(self, message: dict):
         """Send message to all connected WebSocket clients."""
@@ -299,41 +482,35 @@ async def config_page(request: Request):
 
 
 @app.post("/config")
-async def save_config_form(
-    request: Request,
-    llm_provider: str = Form("claude_code"),
-    llm_model: str = Form("sonnet"),
-    browser_mode: str = Form("chrome"),
-    torrent_client: str = Form("embedded"),
-    qbittorrent_host: str = Form("localhost"),
-    qbittorrent_port: int = Form(8080),
-    qbittorrent_username: str = Form("admin"),
-    qbittorrent_password: str = Form("adminadmin"),
-    path_mappings: str = Form(""),
-    download_dir: str = Form("./downloads"),
-    headless: bool = Form(False),
-    log_level: str = Form("INFO"),
-):
+async def save_config_form(request: Request):
     """Save configuration."""
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
+
+    # Parse form data manually to handle checkbox correctly
+    form = await request.form()
+
     # Parse path mappings (one per line)
-    mappings = [m.strip() for m in path_mappings.split("\n") if m.strip()]
+    path_mappings_raw = form.get("path_mappings", "")
+    mappings = [m.strip() for m in path_mappings_raw.split("\n") if m.strip()]
+
+    # Checkbox is present in form only when checked
+    headless = "headless" in form
 
     config_data = {
-        "llm_provider": llm_provider,
-        "llm_model": llm_model,
-        "browser_mode": browser_mode,
-        "torrent_client": torrent_client,
-        "qbittorrent_host": qbittorrent_host,
-        "qbittorrent_port": qbittorrent_port,
-        "qbittorrent_username": qbittorrent_username,
-        "qbittorrent_password": qbittorrent_password,
+        "llm_provider": form.get("llm_provider", "claude_code"),
+        "llm_model": form.get("llm_model", "sonnet"),
+        "browser_mode": form.get("browser_mode", "chrome"),
+        "torrent_client": form.get("torrent_client", "embedded"),
+        "qbittorrent_host": form.get("qbittorrent_host", "localhost"),
+        "qbittorrent_port": int(form.get("qbittorrent_port", 8080)),
+        "qbittorrent_username": form.get("qbittorrent_username", "admin"),
+        "qbittorrent_password": form.get("qbittorrent_password", "adminadmin"),
         "path_mappings": mappings,
-        "download_dir": download_dir,
+        "download_dir": form.get("download_dir", "./downloads"),
         "headless": headless,
-        "log_level": log_level,
+        "log_level": form.get("log_level", "INFO"),
     }
 
     save_config(config_data)
@@ -376,6 +553,25 @@ async def browser_page(request: Request):
         "user": user,
         "is_running": state.is_running,
         "current_task": state.current_task,
+    })
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+async def jobs_page(request: Request):
+    """Job queue management page."""
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    jobs = []
+    if state.job_queue:
+        jobs = await state.job_queue.list_jobs(limit=50)
+
+    return templates.TemplateResponse("jobs.html", {
+        "request": request,
+        "user": user,
+        "jobs": jobs,
+        "api_key": state.api_key,
     })
 
 
@@ -562,15 +758,21 @@ async def get_claude_models(request: Request):
     """Get available Claude models by asking Claude CLI."""
     import asyncio
 
-    # Cache result for 1 hour
-    cache_key = "_claude_models_cache"
-    cache_time = "_claude_models_time"
+    # File-based cache that persists across restarts (OS-appropriate location)
+    cache_dir = Path(user_cache_dir("graboid", "graboid"))
+    cache_file = cache_dir / "claude_models_cache.json"
+    cache_max_age = 86400  # 24 hours
 
-    now = time.time()
-    if hasattr(app.state, cache_key) and hasattr(app.state, cache_time):
-        if now - getattr(app.state, cache_time) < 3600:
-            return {"models": getattr(app.state, cache_key)}
+    # Try to load from file cache first
+    try:
+        if cache_file.exists():
+            data = json.loads(cache_file.read_text())
+            if time.time() - data.get("timestamp", 0) < cache_max_age:
+                return {"models": data.get("models", [])}
+    except Exception:
+        pass
 
+    # Fetch from Claude CLI
     try:
         proc = await asyncio.create_subprocess_exec(
             "claude", "-p",
@@ -578,14 +780,17 @@ async def get_claude_models(request: Request):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
 
         if proc.returncode == 0:
             text = stdout.decode().strip()
             models = [m.strip() for m in text.split(",") if m.strip()]
-            # Cache result
-            setattr(app.state, cache_key, models)
-            setattr(app.state, cache_time, now)
+            # Save to file cache
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps({"timestamp": time.time(), "models": models}))
+            except Exception:
+                pass
             return {"models": models}
     except Exception as e:
         logger.debug(f"Failed to get Claude models: {e}")
@@ -602,12 +807,34 @@ async def get_notes_stats():
     return notes_db.get_stats()
 
 
+@app.get("/api/logs")
+async def get_logs(limit: int = 100, level: str = None, search: str = None):
+    """Get recent logs from memory buffer."""
+    logs = list(log_buffer)
+
+    # Filter by level
+    if level:
+        level_upper = level.upper()
+        logs = [l for l in logs if l["level"] == level_upper]
+
+    # Filter by search term
+    if search:
+        search_lower = search.lower()
+        logs = [l for l in logs if search_lower in l["message"].lower()]
+
+    # Return most recent
+    return {"logs": logs[-limit:]}
+
+
 def get_app_state() -> AppState:
     """Get the global app state for use by other modules."""
     return state
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000):
+DEFAULT_PORT = 8742  # Graboid default port
+
+
+def run_server(host: str = "127.0.0.1", port: int = DEFAULT_PORT):
     """Run the web server."""
     import uvicorn
     uvicorn.run(app, host=host, port=port)

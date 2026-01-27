@@ -291,6 +291,7 @@
         <span class="backend-status" id="backend-status" title="Backend disconnected"></span>
         {% if git.hash %}<span class="version">{{ git.hash }} {{ git.timestamp }} {{ git.tz }} ({{ git.relative }})</span>{% endif %}
         <a href="/" {% if request.url.path == "/" %}class="active"{% endif %}>Dashboard</a>
+        <a href="/jobs" {% if request.url.path == "/jobs" %}class="active"{% endif %}>Jobs</a>
         <a href="/browser" {% if request.url.path == "/browser" %}class="active"{% endif %}>Browser</a>
         <a href="/notes" {% if request.url.path == "/notes" %}class="active"{% endif %}>Notes</a>
         <a href="/config" {% if request.url.path == "/config" %}class="active"{% endif %}>Config</a>

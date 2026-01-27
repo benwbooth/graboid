@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TYPE_CHECKING
 
 import tomllib
 from pydantic import BaseModel
@@ -69,6 +69,26 @@ class Config(BaseSettings):
 
     # Paths
     download_dir: Path = Path.cwd() / "downloads"
+
+    # API settings
+    api_enabled: bool = True
+    api_key: str = ""  # Auto-generated if empty
+
+    # Job queue settings
+    jobs_max_concurrent: int = 1  # Sequential by default for predictability
+    jobs_default_timeout: int = 3600
+    jobs_screenshot_retention_hours: int = 24
+
+    # Default prompt for jobs
+    default_prompt: str = """Find and download the requested content. Look for official sources,
+avoid ads and fake download buttons. Report all download links found."""
+
+    # Local source whitelist
+    local_allowed_paths: list[str] = []
+
+    # Archive cache settings
+    archive_cache_dir: str = "./cache/archives"
+    archive_max_cache_size_gb: int = 10
 
     # LLM settings
     llm_provider: str = "claude_code"  # claude_code, anthropic, openai, ollama, etc.
@@ -205,10 +225,12 @@ class Graboid:
     async def get_browser_agent(self) -> BrowserAgent:
         if self._browser_agent is None:
             self._browser_agent = BrowserAgent(
+                llm_provider=self.config.llm_provider,
+                llm_model=self.config.llm_model,
                 download_controller=self.download_controller,
                 headless=self.config.headless,
             )
-            await self._browser_agent._init_browser()
+            # Browser is lazily initialized in _get_browser() when navigation starts
         return self._browser_agent
 
     async def get_torrent_manager(self) -> TorrentManager:
@@ -273,13 +295,19 @@ class Graboid:
         else:
             raise ValueError(f"Unknown torrent client: {client_type}")
 
-    async def browse(self, url: str, task: str) -> TaskResult:
+    async def browse(
+        self,
+        url: str,
+        task: str,
+        screenshot_callback: "Callable[[bytes, str, str], Any] | None" = None,
+    ) -> TaskResult:
         """
         Navigate to a URL and perform a task using browser automation.
 
         Args:
             url: Starting URL
             task: Description of what to do (e.g., "find download links for X")
+            screenshot_callback: Optional callback for screenshots (data, url, description)
 
         Returns:
             TaskResult with found links and any downloads
@@ -288,6 +316,11 @@ class Graboid:
 
         try:
             agent = await self.get_browser_agent()
+
+            # Set screenshot callback if provided
+            if screenshot_callback:
+                agent.set_screenshot_callback(screenshot_callback)
+
             nav_result = await agent.find_download_links(
                 url=url,
                 description=task,
@@ -297,6 +330,10 @@ class Graboid:
             result.success = nav_result.success
             result.found_links = nav_result.found_links
             result.error = nav_result.error
+
+            # Clear callback after use
+            if screenshot_callback:
+                agent.set_screenshot_callback(None)
 
         except Exception as e:
             result.error = str(e)
@@ -361,7 +398,7 @@ class Graboid:
     async def cleanup(self) -> None:
         """Cleanup resources."""
         if self._browser_agent:
-            await self._browser_agent._close_browser()
+            await self._browser_agent.close()
         if self._torrent_manager:
             await self._torrent_manager.stop()
 
@@ -460,13 +497,43 @@ EXAMPLE_CONFIG = '''\
 # Paths
 download_dir = "./downloads"
 
+# API settings
+[api]
+enabled = true
+api_key = ""  # Auto-generated if empty, or set GRABOID_API_KEY env var
+
+# Job queue settings
+[jobs]
+max_concurrent = 1  # Sequential by default for predictability
+default_timeout = 3600
+screenshot_retention_hours = 24
+
+# Default prompt for jobs
+[prompt]
+default = """
+Find and download the requested content. Look for official sources,
+avoid ads and fake download buttons. Report all download links found.
+"""
+
+# Local filesystem source whitelist (for security)
+[sources.local]
+allowed_paths = ["/mnt/storage", "~/Downloads"]
+
+# Archive handling settings
+[archives]
+cache_dir = "./cache/archives"
+max_cache_size_gb = 10
+
 # LLM settings
+llm_provider = "claude_code"  # claude_code, anthropic, openai, ollama, etc.
+llm_model = "sonnet"
 ollama_model = "llama3.2"
 ollama_host = "http://localhost:11434"
 claude_model = "claude-sonnet-4-20250514"
 prefer_local_llm = true
 
 # Browser settings
+browser_mode = "chrome"  # chrome (Claude integration) or browser_use (Playwright)
 headless = true
 max_navigation_steps = 15
 
