@@ -616,8 +616,7 @@ Start by using cdp_navigate to go to {target.url}.""",
                         filepath = chrome.downloads_dir / filename
                         downloaded_files.append(DownloadResult(
                             success=True,
-                            filepath=filepath,
-                            url="",  # URL unknown from browser download
+                            path=filepath,
                         ))
                     # If we got downloads, consider it a success even if no URLs extracted
                     if not success and downloaded_files:
