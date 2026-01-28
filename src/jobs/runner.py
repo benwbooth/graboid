@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlparse
@@ -223,6 +224,13 @@ class JobRunner:
                 for line in result.raw_output.split('\n')[:50]:  # Limit to first 50 lines
                     if line.strip():
                         await job_log.debug(line, "claude_output")
+
+                # Extract learnings and log them as job-specific notes
+                learning_pattern = r'\[LEARNING:\s*type=(\w+)\]\s*(.+?)(?=\[LEARNING:|$)'
+                for ltype, lcontent in re.findall(learning_pattern, result.raw_output, re.IGNORECASE | re.DOTALL):
+                    lcontent = lcontent.strip()
+                    if lcontent:
+                        await job_log.info(f"[{ltype}] {lcontent}", "learning")
 
             if result.success and result.found_links:
                 job.found_urls = result.found_links

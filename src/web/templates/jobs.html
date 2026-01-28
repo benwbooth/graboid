@@ -326,23 +326,16 @@ async function requeueJob(jobId) {
 }
 
 let currentJobId = null;
-let currentJobDomain = null;
 let screenshotRefreshInterval = null;
 
 async function viewJob(jobId) {
     currentJobId = jobId;
-    currentJobDomain = null;
 
     try {
         const resp = await fetch(`/api/v1/jobs/${jobId}`, {
             headers: { 'X-API-Key': apiKey },
         });
         const job = await resp.json();
-
-        // Extract domain from source URL for filtering notes
-        if (job.source_url) {
-            try { currentJobDomain = new URL(job.source_url).hostname; } catch(e) {}
-        }
 
         const details = document.getElementById('job-details');
         details.innerHTML = `
@@ -558,7 +551,6 @@ function stopScreenshotRefresh() {
 function closeModal() {
     stopScreenshotRefresh();
     currentJobId = null;
-    currentJobDomain = null;
     document.getElementById('job-modal').style.display = 'none';
 }
 
@@ -600,21 +592,18 @@ function timeAgo(dateStr) {
 
 async function loadNotes() {
     const notesEl = document.getElementById('job-notes');
-    if (!notesEl) return;
+    if (!notesEl || !currentJobId) return;
 
     try {
-        // Only fetch notes for this job's domain, not all notes
-        let url = '/api/v1/notes';
-        if (currentJobDomain) {
-            url += `?domain=${encodeURIComponent(currentJobDomain)}`;
-        }
-
-        const resp = await fetch(url, {
+        // Fetch this job's logs and filter for learning entries
+        const resp = await fetch(`/api/v1/jobs/${currentJobId}/logs?limit=500`, {
             headers: { 'X-API-Key': apiKey },
         });
         const data = await resp.json();
 
-        if (data.notes && data.notes.length > 0) {
+        const learnings = (data.logs || []).filter(l => l.source === 'learning');
+
+        if (learnings.length > 0) {
             const typeColors = {
                 'navigation_tip': '#4ecdc4',
                 'obstacle': '#ff6b6b',
@@ -632,24 +621,26 @@ async function loadNotes() {
                 'site_structure': 'Structure',
             };
 
-            notesEl.innerHTML = data.notes.map(note => {
-                const color = typeColors[note.note_type] || 'var(--text-dim)';
-                const icon = typeIcons[note.note_type] || note.note_type;
-                const successBadge = note.success === true ? ' <span style="color: #4ecdc4;">OK</span>' :
-                                     note.success === false ? ' <span style="color: #ff6b6b;">FAIL</span>' : '';
-                const timestamp = note.created_at ? new Date(note.created_at).toLocaleString() : '';
-                const relative = note.created_at ? timeAgo(note.created_at) : '';
+            notesEl.innerHTML = learnings.map(log => {
+                // Parse "[type] content" from log message
+                const match = log.message.match(/^\[(\w+)\]\s*(.+)$/s);
+                const noteType = match ? match[1] : 'note';
+                const content = match ? match[2] : log.message;
+                const color = typeColors[noteType] || 'var(--text-dim)';
+                const icon = typeIcons[noteType] || noteType.replace(/_/g, ' ');
+                const timestamp = new Date(log.timestamp).toLocaleString();
+                const relative = timeAgo(log.timestamp);
                 return `
                     <div style="padding: 0.75rem; margin-bottom: 0.5rem; background: var(--bg); border-radius: 0.25rem; border-left: 3px solid ${color};">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-weight: 600; color: ${color};">${icon}${successBadge}</span>
-                            <span style="font-size: 0.7rem; color: var(--text-dim);" title="${timestamp}">${relative}${relative ? ' · ' : ''}${note.domain}</span>
+                            <span style="font-weight: 600; color: ${color};">${escapeHtml(icon)}</span>
+                            <span style="font-size: 0.7rem; color: var(--text-dim);" title="${timestamp}">${relative}</span>
                         </div>
-                        <div style="margin-top: 0.25rem; font-size: 0.85rem;">${escapeHtml(note.content)}</div>
+                        <div style="margin-top: 0.25rem; font-size: 0.85rem;">${escapeHtml(content)}</div>
                     </div>`;
             }).join('');
         } else {
-            notesEl.innerHTML = `<div style="color: var(--text-dim);">No agent notes for ${currentJobDomain ? escapeHtml(currentJobDomain) : 'this job'} yet.</div>`;
+            notesEl.innerHTML = '<div style="color: var(--text-dim);">No agent notes for this job yet.</div>';
         }
     } catch (err) {
         notesEl.innerHTML = `<div style="color: #ff6b6b;">Failed to load notes: ${err.message}</div>`;
