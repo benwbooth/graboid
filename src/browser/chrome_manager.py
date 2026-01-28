@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +54,9 @@ class ChromeManager:
         self.user_data_dir = chrome_data_dir or data_dir / "chrome_profile"
 
         self._process: asyncio.subprocess.Process | None = None
-        self._ws_url: str | None = None
-        self._cdp_ws: Any = None
+        self._browser_ws_url: str | None = None  # Browser-level target
+        self._page_ws_url: str | None = None  # Page-level target
+        self._ws: Any = None  # Persistent page-level WS connection
         self._message_id = 0
 
     def _find_chrome(self) -> str | None:
@@ -132,15 +132,15 @@ class ChromeManager:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            # Wait for Chrome to start and get WebSocket URL
-            await asyncio.sleep(1)  # Give Chrome time to start
+            # Wait for Chrome to start and connect CDP
+            await asyncio.sleep(1)
 
             if not await self._connect_cdp():
                 logger.error("Failed to connect to Chrome CDP")
                 await self.stop()
                 return False
 
-            # Configure download behavior
+            # Configure download behavior via persistent connection
             await self._configure_downloads()
 
             logger.info(f"Chrome started successfully (PID: {self._process.pid})")
@@ -151,18 +151,40 @@ class ChromeManager:
             return False
 
     async def _connect_cdp(self, retries: int = 5) -> bool:
-        """Connect to Chrome's CDP WebSocket."""
+        """Connect to Chrome's CDP via page target (supports all domains)."""
         import aiohttp
 
         for attempt in range(retries):
             try:
                 async with aiohttp.ClientSession() as session:
+                    # Get the browser-level WS URL
                     async with session.get(f"http://localhost:{self.debug_port}/json/version") as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            self._ws_url = data.get("webSocketDebuggerUrl")
-                            logger.info(f"CDP WebSocket URL: {self._ws_url}")
-                            return True
+                            self._browser_ws_url = data.get("webSocketDebuggerUrl")
+                            logger.info(f"CDP browser WS: {self._browser_ws_url}")
+
+                    # Get a page target WS URL — needed for Page.*, Runtime.*, etc.
+                    async with session.get(f"http://localhost:{self.debug_port}/json/list") as resp:
+                        if resp.status == 200:
+                            targets = await resp.json()
+                            for target in targets:
+                                if target.get("type") == "page":
+                                    self._page_ws_url = target.get("webSocketDebuggerUrl")
+                                    logger.info(f"CDP page WS: {self._page_ws_url}")
+                                    break
+
+                    if self._page_ws_url:
+                        # Open a persistent connection to the page target
+                        self._ws = await websockets.connect(self._page_ws_url)
+                        logger.info("Persistent CDP page connection established")
+                        return True
+                    elif self._browser_ws_url:
+                        logger.warning("No page target found, falling back to browser target")
+                        self._page_ws_url = self._browser_ws_url
+                        self._ws = await websockets.connect(self._browser_ws_url)
+                        return True
+
             except Exception as e:
                 logger.debug(f"CDP connection attempt {attempt + 1} failed: {e}")
                 await asyncio.sleep(0.5)
@@ -170,52 +192,98 @@ class ChromeManager:
         return False
 
     async def _send_cdp(self, method: str, params: dict | None = None) -> dict:
-        """Send a CDP command and wait for response."""
-        if not self._ws_url:
+        """Send a CDP command over the persistent connection."""
+        if not self._ws:
             raise RuntimeError("Not connected to Chrome CDP")
 
         self._message_id += 1
+        msg_id = self._message_id
         message = {
-            "id": self._message_id,
+            "id": msg_id,
             "method": method,
             "params": params or {},
         }
 
-        async with websockets.connect(self._ws_url) as ws:
-            await ws.send(json.dumps(message))
+        try:
+            await self._ws.send(json.dumps(message))
 
             while True:
-                response = json.loads(await ws.recv())
-                if response.get("id") == self._message_id:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
+                response = json.loads(raw)
+                if response.get("id") == msg_id:
                     if "error" in response:
                         raise RuntimeError(f"CDP error: {response['error']}")
                     return response.get("result", {})
+                # Ignore events / responses for other message IDs
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("CDP connection closed, reconnecting...")
+            await self._reconnect()
+            return await self._send_cdp(method, params)
+
+    async def _reconnect(self) -> None:
+        """Re-establish CDP connection (e.g. after chrome-devtools-mcp creates new tabs)."""
+        self._ws = None
+        await self._refresh_page_target()
+        if self._page_ws_url:
+            self._ws = await websockets.connect(self._page_ws_url)
+            await self._configure_downloads()
+            logger.info("CDP reconnected and downloads reconfigured")
+
+    async def _refresh_page_target(self) -> None:
+        """Refresh the page target WS URL (picks the latest page)."""
+        import aiohttp
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://localhost:{self.debug_port}/json/list") as resp:
+                    if resp.status == 200:
+                        targets = await resp.json()
+                        # Prefer non-about:blank pages
+                        for target in targets:
+                            if target.get("type") == "page" and "about:blank" not in target.get("url", ""):
+                                self._page_ws_url = target.get("webSocketDebuggerUrl")
+                                logger.info(f"Refreshed page target: {self._page_ws_url}")
+                                return
+                        # Fall back to any page
+                        for target in targets:
+                            if target.get("type") == "page":
+                                self._page_ws_url = target.get("webSocketDebuggerUrl")
+                                logger.info(f"Refreshed page target (fallback): {self._page_ws_url}")
+                                return
+        except Exception as e:
+            logger.warning(f"Failed to refresh page target: {e}")
 
     async def _configure_downloads(self) -> None:
         """Configure Chrome to auto-download to our directory."""
+        download_path = str(self.downloads_dir.resolve())
+
+        # Set download behavior at browser level (applies to all pages/tabs)
         try:
-            # Use Browser.setDownloadBehavior for automatic downloads
             await self._send_cdp("Browser.setDownloadBehavior", {
-                "behavior": "allow",
-                "downloadPath": str(self.downloads_dir),
+                "behavior": "allowAndName",
+                "downloadPath": download_path,
                 "eventsEnabled": True,
             })
-            logger.info(f"CDP download behavior configured: {self.downloads_dir}")
+            logger.info(f"Browser.setDownloadBehavior configured: {download_path}")
         except Exception as e:
-            logger.warning(f"Failed to set download behavior via CDP: {e}")
-            # Try Page.setDownloadBehavior as fallback (older API)
-            try:
-                await self._send_cdp("Page.setDownloadBehavior", {
-                    "behavior": "allow",
-                    "downloadPath": str(self.downloads_dir),
-                })
-                logger.info("Fallback Page.setDownloadBehavior succeeded")
-            except Exception as e2:
-                logger.warning(f"Fallback also failed: {e2}")
+            logger.warning(f"Browser.setDownloadBehavior failed: {e}")
+
+        # Also set at page level for older Chrome and as reinforcement
+        try:
+            await self._send_cdp("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": download_path,
+            })
+            logger.info(f"Page.setDownloadBehavior configured: {download_path}")
+        except Exception as e:
+            logger.debug(f"Page.setDownloadBehavior failed (non-critical): {e}")
 
     async def take_screenshot(self) -> bytes | None:
         """Take a screenshot via CDP, returning PNG bytes."""
         try:
+            # Reconnect to the active page if needed (chrome-devtools-mcp may
+            # have opened new tabs since we last connected)
+            await self._ensure_active_page()
             import base64
             result = await self._send_cdp("Page.captureScreenshot", {"format": "png"})
             data = result.get("data")
@@ -225,9 +293,44 @@ class ChromeManager:
             logger.debug(f"Screenshot failed: {e}")
         return None
 
+    async def _ensure_active_page(self) -> None:
+        """Switch to the active (non-blank) page target if it changed."""
+        import aiohttp
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://localhost:{self.debug_port}/json/list") as resp:
+                    if resp.status != 200:
+                        return
+                    targets = await resp.json()
+
+            # Find the best page target (prefer non-blank)
+            best = None
+            for target in targets:
+                if target.get("type") == "page":
+                    url = target.get("url", "")
+                    ws_url = target.get("webSocketDebuggerUrl")
+                    if ws_url and "about:blank" not in url:
+                        best = ws_url
+                        break
+                    elif ws_url and best is None:
+                        best = ws_url
+
+            if best and best != self._page_ws_url:
+                logger.info(f"Switching to active page target: {best}")
+                self._page_ws_url = best
+                if self._ws:
+                    await self._ws.close()
+                self._ws = await websockets.connect(best)
+                await self._configure_downloads()
+
+        except Exception as e:
+            logger.debug(f"_ensure_active_page failed: {e}")
+
     async def get_current_url(self) -> str:
         """Get the current page URL via CDP."""
         try:
+            await self._ensure_active_page()
             result = await self._send_cdp("Runtime.evaluate", {
                 "expression": "window.location.href"
             })
@@ -247,6 +350,13 @@ class ChromeManager:
 
     async def stop(self) -> None:
         """Stop Chrome and cleanup."""
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
         if self._process:
             logger.info("Stopping Chrome...")
             try:
@@ -257,7 +367,8 @@ class ChromeManager:
                 await self._process.wait()
             self._process = None
 
-        self._ws_url = None
+        self._browser_ws_url = None
+        self._page_ws_url = None
         logger.info("Chrome stopped")
 
     @property
