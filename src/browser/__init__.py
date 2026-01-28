@@ -4,10 +4,12 @@ from .agent import (
     BrowserAgent,
     LLMProvider,
     NavigationResult,
+    NavigationStep,
     NavigationTarget,
     create_browser_agent,
     get_llm,
 )
+from .chrome_manager import ChromeManager, create_chrome_manager
 from .chrome_agent import (
     ChromeBrowserAgent,
     ChromeNavigationResult,
@@ -20,16 +22,19 @@ __all__ = [
     "AgentNote",
     "BrowserAgent",
     "ChromeBrowserAgent",
+    "ChromeManager",
     "ChromeNavigationResult",
     "DownloadController",
     "DownloadResult",
     "LLMProvider",
     "NavigationResult",
+    "NavigationStep",
     "NavigationTarget",
     "NotesDB",
     "NoteType",
     "create_browser_agent",
     "create_chrome_agent",
+    "create_chrome_manager",
     "get_llm",
     "get_notes_db",
 ]

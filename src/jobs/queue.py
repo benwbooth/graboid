@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Callable
 
 from .database import JobDatabase
-from .models import Job, JobCreateRequest, JobPhase, JobScreenshot, JobStatus
+from .models import Job, JobCreateRequest, JobLog, JobPhase, JobScreenshot, JobStatus, JobStep
 
 
 class JobQueue:
@@ -161,6 +161,58 @@ class JobQueue:
     async def get_screenshots(self, job_id: str) -> list[JobScreenshot]:
         """Get all screenshots for a job."""
         return await self.db.get_screenshots(job_id)
+
+    async def add_steps(self, job_id: str, steps: list[dict]) -> None:
+        """Add navigation steps for a job.
+
+        Args:
+            job_id: Job ID
+            steps: List of step dictionaries with action, observation, url, is_error
+        """
+        job_steps = [
+            JobStep(
+                job_id=job_id,
+                step_number=step.get("step_number", i + 1),
+                action=step.get("action", ""),
+                observation=step.get("observation", ""),
+                url=step.get("url", ""),
+                is_error=step.get("is_error", False),
+            )
+            for i, step in enumerate(steps)
+        ]
+        await self.db.add_steps(job_steps)
+
+    async def get_steps(self, job_id: str) -> list[JobStep]:
+        """Get all navigation steps for a job."""
+        return await self.db.get_steps(job_id)
+
+    async def clear_steps(self, job_id: str) -> None:
+        """Clear all steps for a job (useful when re-running)."""
+        await self.db.clear_steps(job_id)
+
+    async def add_log(
+        self,
+        job_id: str,
+        message: str,
+        level: str = "INFO",
+        source: str = "",
+    ) -> None:
+        """Add a log entry for a job."""
+        log = JobLog(
+            job_id=job_id,
+            level=level,
+            source=source,
+            message=message,
+        )
+        await self.db.add_log(log)
+
+    async def get_logs(self, job_id: str, limit: int = 500) -> list[JobLog]:
+        """Get logs for a job."""
+        return await self.db.get_logs(job_id, limit)
+
+    async def clear_logs(self, job_id: str) -> None:
+        """Clear all logs for a job."""
+        await self.db.clear_logs(job_id)
 
     async def get_next_job(self) -> Job | None:
         """Get the next pending job to execute."""

@@ -132,39 +132,33 @@ class ClaudeCodeChat:
             parts.append(f"IMAGES TO ANALYZE:\n{chr(10).join(image_instructions)}")
             parts.append("IMPORTANT: Use the Read tool to view each image file listed above before responding.")
 
-        parts.append(f"CONVERSATION:\n{text}")
-
-        # If output_format is provided, include JSON schema instructions
+        # If output_format is provided, include JSON schema instructions FIRST
         if output_format is not None:
             try:
                 schema = output_format.model_json_schema()
                 schema_str = json.dumps(schema, indent=2)
-                parts.append(f"""
-IMPORTANT: You MUST respond with ONLY valid JSON matching this schema:
+                parts.insert(0, f"""⚠️ CRITICAL: YOUR ENTIRE RESPONSE MUST BE VALID JSON. NO OTHER TEXT. ⚠️
+
+You are a browser automation agent. Output ONLY a JSON object matching this schema:
 {schema_str}
 
 Required fields: evaluation_previous_goal, memory, next_goal, action
 
-The 'action' field must be a list with at least one action object. Each action should have exactly ONE action type.
+The 'action' field must be a list with at least one action. Each action has exactly ONE action type.
 Common action types: go_to_url, click_element, input_text, scroll_down, scroll_up, done
 
-Example response format:
-{{
-  "evaluation_previous_goal": "Evaluating what happened after the last action",
-  "memory": "Key information to remember",
-  "next_goal": "What I will do next",
-  "action": [
-    {{"go_to_url": {{"url": "https://example.com"}}}}
-  ]
-}}
+Example (your response must look EXACTLY like this, just JSON):
+{{"evaluation_previous_goal": "Starting task", "memory": "Need to navigate", "next_goal": "Go to website", "action": [{{"go_to_url": {{"url": "https://example.com"}}}}]}}
 
-Respond with ONLY the JSON object, no other text or markdown.""")
+DO NOT include any explanations, markdown, or text outside the JSON object.""")
             except Exception as e:
                 logger.warning(f"Could not get JSON schema: {e}")
 
+        parts.append(f"CONVERSATION:\n{text}")
+
         return "\n\n".join(parts)
 
-    async def _call_claude_cli(self, prompt: str, image_paths: list[Path]) -> str:
+    async def _call_claude_cli(self, prompt: str, image_paths: list[Path], use_chrome: bool = False) -> str:
         """Call claude CLI and return response."""
         # Build command
         cmd = [
@@ -173,10 +167,15 @@ Respond with ONLY the JSON object, no other text or markdown.""")
             "--model", self.model,
             "--dangerously-skip-permissions",  # Need this to read files without prompts
             "--output-format", "text",
-            prompt,
         ]
 
-        logger.debug(f"Calling claude CLI with {len(image_paths)} images")
+        # Add chrome integration if requested
+        if use_chrome:
+            cmd.append("--chrome")
+
+        cmd.append(prompt)
+
+        logger.debug(f"Calling claude CLI with {len(image_paths)} images, chrome={use_chrome}")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -231,7 +230,7 @@ Respond with ONLY the JSON object, no other text or markdown.""")
                         return text[:i+1]
         return text
 
-    async def ainvoke(self, messages: list[dict], *args, **kwargs) -> "AIMessage":
+    async def ainvoke(self, messages: list[dict], *args, **kwargs):
         """
         Async invoke - main entry point for browser-use.
 
@@ -243,7 +242,13 @@ Respond with ONLY the JSON object, no other text or markdown.""")
         Returns:
             AIMessage-like object with content and completion
         """
+        import sys
+        print(f"[ClaudeCodeLLM] ainvoke called with {len(messages)} messages, args={args}, kwargs={list(kwargs.keys())}", file=sys.stderr)
+        # output_format can be passed as positional arg or kwarg
         output_format = kwargs.get("output_format")
+        if output_format is None and args:
+            output_format = args[0]
+        print(f"[ClaudeCodeLLM] output_format={output_format}", file=sys.stderr)
         text, image_paths = self._extract_images_and_text(messages)
         prompt = self._build_prompt(text, image_paths, output_format)
 
@@ -253,37 +258,41 @@ Respond with ONLY the JSON object, no other text or markdown.""")
             # Try to parse structured output if output_format is provided
             completion = None
             if output_format is not None:
-                logger.info(f"Attempting to parse response into {output_format.__name__}")
-                logger.info(f"Raw response (first 1000 chars): {response[:1000]}")
+                import sys
+                print(f"[ClaudeCodeLLM] Attempting to parse response into {output_format.__name__}", file=sys.stderr)
+                print(f"[ClaudeCodeLLM] Raw response (first 500 chars): {response[:500]}", file=sys.stderr)
                 try:
                     json_str = self._extract_json(response)
-                    logger.info(f"Extracted JSON (first 500 chars): {json_str[:500]}")
+                    print(f"[ClaudeCodeLLM] Extracted JSON (first 300 chars): {json_str[:300]}", file=sys.stderr)
                     data = json.loads(json_str)
                     completion = output_format.model_validate(data)
-                    logger.info(f"Successfully parsed response into {output_format.__name__}")
+                    print(f"[ClaudeCodeLLM] Successfully parsed response!", file=sys.stderr)
                 except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse JSON from response: {e}")
-                    logger.error(f"Response was: {response[:1000]}")
+                    print(f"[ClaudeCodeLLM] Failed to parse JSON: {e}", file=sys.stderr)
+                    print(f"[ClaudeCodeLLM] Response was: {response[:500]}", file=sys.stderr)
                 except Exception as e:
-                    logger.error(f"Failed to validate response against schema: {e}")
-                    logger.error(f"JSON data: {json_str[:1000] if 'json_str' in dir() else 'N/A'}")
+                    print(f"[ClaudeCodeLLM] Failed to validate: {e}", file=sys.stderr)
+                    print(f"[ClaudeCodeLLM] JSON data: {json_str[:500] if 'json_str' in dir() else 'N/A'}", file=sys.stderr)
+            else:
+                import sys
+                print(f"[ClaudeCodeLLM] No output_format provided, skipping parsing", file=sys.stderr)
 
-            return AIMessage(content=response, completion=completion)
+            return _create_completion_response(response, completion, output_format)
         finally:
             # Cleanup temp images
             for path in image_paths:
                 self._cleanup_image(path)
 
-    def invoke(self, messages: list[dict], *args, **kwargs) -> "AIMessage":
+    def invoke(self, messages: list[dict], *args, **kwargs):
         """Sync invoke - runs async version."""
         return asyncio.run(self.ainvoke(messages, *args, **kwargs))
 
-    async def astream(self, messages: list[dict], *args, **kwargs) -> AsyncIterator["AIMessage"]:
+    async def astream(self, messages: list[dict], *args, **kwargs) -> AsyncIterator:
         """Async stream - browser-use may use this."""
         result = await self.ainvoke(messages, *args, **kwargs)
         yield result
 
-    def stream(self, messages: list[dict], *args, **kwargs) -> Iterator["AIMessage"]:
+    def stream(self, messages: list[dict], *args, **kwargs) -> Iterator:
         """Sync stream."""
         result = self.invoke(messages, *args, **kwargs)
         yield result
@@ -298,32 +307,47 @@ Respond with ONLY the JSON object, no other text or markdown.""")
         return self
 
 
+def _create_completion_response(content: str, completion: Any, output_format: Any = None) -> Any:
+    """Create a ChatInvokeCompletion response for browser-use."""
+    from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+
+    output_tokens = len(content.split()) * 2  # Rough estimate
+    usage = ChatInvokeUsage(
+        prompt_tokens=0,
+        prompt_cached_tokens=0,
+        prompt_cache_creation_tokens=0,
+        prompt_image_tokens=0,
+        completion_tokens=output_tokens,
+        total_tokens=output_tokens,
+    )
+
+    # If we have a parsed completion, use it
+    # If not and output_format was expected, raise an error
+    if completion is not None:
+        final_completion = completion
+    elif output_format is not None:
+        # Parsing failed but structured output was expected - raise error
+        raise ValueError(f"Failed to parse response into {output_format.__name__}. Response: {content[:200]}")
+    else:
+        # No structured output expected, use raw content
+        final_completion = content
+
+    return ChatInvokeCompletion(
+        completion=final_completion,
+        usage=usage,
+        thinking=None,
+        redacted_thinking=None,
+        stop_reason="end_turn",
+    )
+
+
 class AIMessage:
-    """Simple message class to match LangChain interface."""
+    """Simple message class for fallback/compatibility."""
 
     def __init__(self, content: str, tool_calls: list | None = None, completion: Any = None):
         self.content = content
         self.tool_calls = tool_calls or []
-        self.additional_kwargs = {}
-        self.response_metadata = {}  # LangChain compatibility
-        self.id = None  # Message ID
-        self.completion = completion  # Parsed structured output for browser-use
-        # Mock usage stats as dict (browser-use/pydantic expects specific fields)
-        output_tokens = len(content.split()) * 2  # Rough estimate
-        self.usage_metadata = {
-            'input_tokens': 0,
-            'output_tokens': output_tokens,
-            'total_tokens': output_tokens,
-        }
-        # browser-use expects these exact fields for TokenUsageEntry
-        self.usage = {
-            'prompt_tokens': 0,
-            'prompt_cached_tokens': 0,
-            'prompt_cache_creation_tokens': 0,
-            'prompt_image_tokens': 0,
-            'completion_tokens': output_tokens,
-            'total_tokens': output_tokens,
-        }
+        self.completion = completion
 
     def __str__(self) -> str:
         return self.content

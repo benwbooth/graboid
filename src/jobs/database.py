@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .models import Job, JobScreenshot, JobStatus
+from .models import Job, JobLog, JobScreenshot, JobStatus, JobStep
 
 
 class JobDatabase:
@@ -50,6 +50,34 @@ class JobDatabase:
 
     CREATE INDEX IF NOT EXISTS idx_screenshots_job_id ON job_screenshots(job_id);
     CREATE INDEX IF NOT EXISTS idx_screenshots_timestamp ON job_screenshots(timestamp);
+
+    CREATE TABLE IF NOT EXISTS job_steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        step_number INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        observation TEXT,
+        url TEXT,
+        is_error BOOLEAN DEFAULT 0,
+        timestamp TIMESTAMP NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_steps_job_id ON job_steps(job_id);
+    CREATE INDEX IF NOT EXISTS idx_steps_step_number ON job_steps(job_id, step_number);
+
+    CREATE TABLE IF NOT EXISTS job_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        timestamp TIMESTAMP NOT NULL,
+        level TEXT NOT NULL,
+        source TEXT,
+        message TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_logs_job_id ON job_logs(job_id);
+    CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON job_logs(job_id, timestamp);
     """
 
     def __init__(self, db_path: str | Path):
@@ -250,3 +278,79 @@ class JobDatabase:
         )
         await conn.commit()
         return cursor.rowcount
+
+    # Step operations
+
+    async def add_step(self, step: JobStep) -> int:
+        """Add a navigation step for a job."""
+        conn = await self._get_conn()
+        data = step.to_dict()
+        cursor = await conn.execute(
+            """INSERT INTO job_steps (job_id, step_number, action, observation, url, is_error, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (data["job_id"], data["step_number"], data["action"], data["observation"],
+             data["url"], data["is_error"], data["timestamp"]),
+        )
+        await conn.commit()
+        return cursor.lastrowid or 0
+
+    async def add_steps(self, steps: list[JobStep]) -> None:
+        """Add multiple navigation steps for a job."""
+        if not steps:
+            return
+        conn = await self._get_conn()
+        for step in steps:
+            data = step.to_dict()
+            await conn.execute(
+                """INSERT INTO job_steps (job_id, step_number, action, observation, url, is_error, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (data["job_id"], data["step_number"], data["action"], data["observation"],
+                 data["url"], data["is_error"], data["timestamp"]),
+            )
+        await conn.commit()
+
+    async def get_steps(self, job_id: str) -> list[JobStep]:
+        """Get all navigation steps for a job."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT * FROM job_steps WHERE job_id = ? ORDER BY step_number ASC",
+            (job_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [JobStep.from_dict(dict(row)) for row in rows]
+
+    async def clear_steps(self, job_id: str) -> None:
+        """Clear all steps for a job (useful when re-running)."""
+        conn = await self._get_conn()
+        await conn.execute("DELETE FROM job_steps WHERE job_id = ?", (job_id,))
+        await conn.commit()
+
+    # Log operations
+
+    async def add_log(self, log: JobLog) -> int:
+        """Add a log entry for a job."""
+        conn = await self._get_conn()
+        data = log.to_dict()
+        cursor = await conn.execute(
+            """INSERT INTO job_logs (job_id, timestamp, level, source, message)
+               VALUES (?, ?, ?, ?, ?)""",
+            (data["job_id"], data["timestamp"], data["level"], data["source"], data["message"]),
+        )
+        await conn.commit()
+        return cursor.lastrowid or 0
+
+    async def get_logs(self, job_id: str, limit: int = 500) -> list[JobLog]:
+        """Get logs for a job."""
+        conn = await self._get_conn()
+        async with conn.execute(
+            "SELECT * FROM job_logs WHERE job_id = ? ORDER BY timestamp ASC LIMIT ?",
+            (job_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [JobLog.from_dict(dict(row)) for row in rows]
+
+    async def clear_logs(self, job_id: str) -> None:
+        """Clear all logs for a job."""
+        conn = await self._get_conn()
+        await conn.execute("DELETE FROM job_logs WHERE job_id = ?", (job_id,))
+        await conn.commit()

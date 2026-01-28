@@ -379,6 +379,16 @@ async function viewJob(jobId) {
                 </div>
             </div>
 
+            <div style="margin-top: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>Navigation Steps</h3>
+                    <button type="button" onclick="loadJobSteps('${job.id}')" class="secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Refresh</button>
+                </div>
+                <div id="job-steps" style="margin-top: 0.5rem; max-height: 300px; overflow-y: auto;">
+                    <div style="color: var(--text-dim);">Loading steps...</div>
+                </div>
+            </div>
+
             ${job.found_urls && job.found_urls.length > 0 ? `
                 <h3 style="margin-top: 1.5rem;">Found URLs (${job.found_urls.length})</h3>
                 <ul style="margin-top: 0.5rem; padding-left: 1.5rem; max-height: 150px; overflow-y: auto;">
@@ -409,13 +419,25 @@ async function viewJob(jobId) {
                     <div style="color: var(--text-dim);">Loading logs...</div>
                 </div>
             </div>
+
+            <div style="margin-top: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>Agent Notes</h3>
+                    <button type="button" onclick="loadNotes()" class="secondary" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Refresh</button>
+                </div>
+                <div id="job-notes" style="margin-top: 0.5rem;">
+                    <div style="color: var(--text-dim);">Loading notes...</div>
+                </div>
+            </div>
         `;
 
         document.getElementById('job-modal').style.display = 'block';
 
-        // Load screenshots and logs
+        // Load screenshots, steps, logs, and notes
         await loadJobScreenshots(jobId);
+        await loadJobSteps(jobId);
         await refreshLogs();
+        await loadNotes();
 
         // Start auto-refresh if job is active
         if (isActive(job.status)) {
@@ -453,6 +475,38 @@ async function loadJobScreenshots(jobId) {
     }
 }
 
+async function loadJobSteps(jobId) {
+    const container = document.getElementById('job-steps');
+    if (!container) return;
+
+    try {
+        const resp = await fetch(`/api/v1/jobs/${jobId}/steps`, {
+            headers: { 'X-API-Key': apiKey },
+        });
+        const data = await resp.json();
+
+        if (data.steps && data.steps.length > 0) {
+            container.innerHTML = data.steps.map(step => `
+                <div style="padding: 0.75rem; margin-bottom: 0.5rem; background: var(--bg); border-radius: 0.25rem; border-left: 3px solid ${step.is_error ? 'var(--error)' : 'var(--accent)'};">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                        <div style="font-weight: 600; color: ${step.is_error ? 'var(--error)' : 'var(--text)'};">
+                            Step ${step.step_number}: ${escapeHtml(step.action)}
+                        </div>
+                        <div style="font-size: 0.7rem; color: var(--text-dim);">${new Date(step.timestamp).toLocaleTimeString()}</div>
+                    </div>
+                    ${step.observation ? `<div style="margin-top: 0.5rem; color: var(--text-dim); font-size: 0.85rem;">${escapeHtml(step.observation)}</div>` : ''}
+                    ${step.url ? `<div style="margin-top: 0.25rem; font-size: 0.75rem; color: var(--accent); word-break: break-all;">${escapeHtml(step.url)}</div>` : ''}
+                </div>
+            `).join('');
+        } else {
+            container.innerHTML = '<div style="color: var(--text-dim); padding: 0.5rem;">No navigation steps recorded yet. Claude Chrome integration will log steps here.</div>';
+        }
+    } catch (err) {
+        console.error('Failed to load steps:', err);
+        container.innerHTML = '<div style="color: var(--error);">Failed to load steps: ' + escapeHtml(err.message) + '</div>';
+    }
+}
+
 async function refreshJobDetails(jobId) {
     try {
         const resp = await fetch(`/api/v1/jobs/${jobId}`, {
@@ -466,8 +520,9 @@ async function refreshJobDetails(jobId) {
             msgEl.textContent = job.progress_message || 'Waiting...';
         }
 
-        // Load latest screenshot and logs
+        // Load latest screenshot, steps, and logs
         await loadJobScreenshots(jobId);
+        await loadJobSteps(jobId);
         await refreshLogs();
 
         // Stop refresh if job completed
@@ -519,35 +574,82 @@ handleMessage = function(data) {
     }
 };
 
-// Auto-refresh every 5 seconds if there are active jobs
-setInterval(() => {
-    const activeJobs = document.querySelectorAll('.tag.warning');
-    if (activeJobs.length > 0) {
-        refreshJobs();
+// Auto-refresh job queue every 7 seconds
+setInterval(() => refreshJobs(), 7000);
+
+async function loadNotes() {
+    const notesEl = document.getElementById('job-notes');
+    if (!notesEl) return;
+
+    try {
+        const resp = await fetch('/api/v1/notes', {
+            headers: { 'X-API-Key': apiKey },
+        });
+        const data = await resp.json();
+
+        if (data.notes && data.notes.length > 0) {
+            const typeColors = {
+                'navigation_tip': '#4ecdc4',
+                'obstacle': '#ff6b6b',
+                'workaround': '#95e1d3',
+                'download_method': '#a8d8ea',
+                'source_quality': '#ffd93d',
+                'site_structure': '#c9b1ff',
+            };
+            const typeIcons = {
+                'navigation_tip': 'Tip',
+                'obstacle': 'Obstacle',
+                'workaround': 'Workaround',
+                'download_method': 'Download',
+                'source_quality': 'Quality',
+                'site_structure': 'Structure',
+            };
+
+            notesEl.innerHTML = data.notes.map(note => {
+                const color = typeColors[note.note_type] || 'var(--text-dim)';
+                const icon = typeIcons[note.note_type] || note.note_type;
+                const successBadge = note.success === true ? ' <span style="color: #4ecdc4;">OK</span>' :
+                                     note.success === false ? ' <span style="color: #ff6b6b;">FAIL</span>' : '';
+                return `
+                    <div style="padding: 0.75rem; margin-bottom: 0.5rem; background: var(--bg); border-radius: 0.25rem; border-left: 3px solid ${color};">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-weight: 600; color: ${color};">${icon}${successBadge}</span>
+                            <span style="font-size: 0.7rem; color: var(--text-dim);">${note.domain}</span>
+                        </div>
+                        <div style="margin-top: 0.25rem; font-size: 0.85rem;">${escapeHtml(note.content)}</div>
+                    </div>`;
+            }).join('');
+        } else {
+            notesEl.innerHTML = '<div style="color: var(--text-dim);">No agent notes recorded yet.</div>';
+        }
+    } catch (err) {
+        notesEl.innerHTML = `<div style="color: #ff6b6b;">Failed to load notes: ${err.message}</div>`;
     }
-}, 5000);
+}
 
 async function refreshLogs() {
     const logsEl = document.getElementById('job-logs');
-    if (!logsEl) return;
+    if (!logsEl || !currentJobId) return;
 
     try {
-        const resp = await fetch('/api/logs?limit=200', {
+        const resp = await fetch(`/api/v1/jobs/${currentJobId}/logs?limit=500`, {
             headers: { 'X-API-Key': apiKey },
         });
         const data = await resp.json();
 
         if (data.logs && data.logs.length > 0) {
             logsEl.innerHTML = data.logs.map(log => {
-                const time = new Date(log.time * 1000).toLocaleTimeString();
+                const time = new Date(log.timestamp).toLocaleTimeString();
                 const levelClass = log.level === 'ERROR' ? 'color: #ff6b6b;' :
-                                   log.level === 'WARNING' ? 'color: #ffd93d;' : '';
-                return `<div style="${levelClass}"><span style="color: var(--text-dim);">[${time}]</span> ${escapeHtml(log.message)}</div>`;
+                                   log.level === 'WARNING' ? 'color: #ffd93d;' :
+                                   log.level === 'DEBUG' ? 'color: #888;' : '';
+                const sourceTag = log.source ? `<span style="color: var(--accent);">[${log.source}]</span> ` : '';
+                return `<div style="${levelClass}"><span style="color: var(--text-dim);">[${time}]</span> ${sourceTag}${escapeHtml(log.message)}</div>`;
             }).join('');
             // Scroll to bottom
             logsEl.scrollTop = logsEl.scrollHeight;
         } else {
-            logsEl.innerHTML = '<div style="color: var(--text-dim);">No logs available</div>';
+            logsEl.innerHTML = '<div style="color: var(--text-dim);">No logs for this job yet</div>';
         }
     } catch (err) {
         logsEl.innerHTML = `<div style="color: #ff6b6b;">Failed to load logs: ${err.message}</div>`;

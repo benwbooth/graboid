@@ -187,6 +187,84 @@ class JobScreenshot:
 
 
 @dataclass
+class JobStep:
+    """Represents a navigation step during job execution."""
+
+    id: int | None = None
+    job_id: str = ""
+    step_number: int = 0
+    action: str = ""
+    observation: str = ""
+    url: str = ""
+    is_error: bool = False
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for storage."""
+        return {
+            "job_id": self.job_id,
+            "step_number": self.step_number,
+            "action": self.action,
+            "observation": self.observation,
+            "url": self.url,
+            "is_error": self.is_error,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobStep":
+        """Create from dictionary."""
+        return cls(
+            id=data.get("id"),
+            job_id=data["job_id"],
+            step_number=data.get("step_number", 0),
+            action=data.get("action", ""),
+            observation=data.get("observation", ""),
+            url=data.get("url", ""),
+            is_error=data.get("is_error", False),
+            timestamp=datetime.fromisoformat(data["timestamp"])
+            if isinstance(data.get("timestamp"), str)
+            else data.get("timestamp", datetime.utcnow()),
+        )
+
+
+@dataclass
+class JobLog:
+    """Represents a log entry for a job."""
+
+    id: int | None = None
+    job_id: str = ""
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    level: str = "INFO"
+    source: str = ""
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for storage."""
+        return {
+            "job_id": self.job_id,
+            "timestamp": self.timestamp.isoformat(),
+            "level": self.level,
+            "source": self.source,
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JobLog":
+        """Create from dictionary."""
+        return cls(
+            id=data.get("id"),
+            job_id=data["job_id"],
+            timestamp=datetime.fromisoformat(data["timestamp"])
+            if isinstance(data.get("timestamp"), str)
+            else data.get("timestamp", datetime.utcnow()),
+            level=data.get("level", "INFO"),
+            source=data.get("source", ""),
+            message=data.get("message", ""),
+        )
+
+
+@dataclass
 class JobCreateRequest:
     """Request to create a new job."""
 

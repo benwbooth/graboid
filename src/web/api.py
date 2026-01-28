@@ -340,6 +340,69 @@ async def get_job_screenshots(
     }
 
 
+@router.get("/jobs/{job_id}/steps")
+async def get_job_steps(
+    request: Request,
+    job_id: str,
+    _api_key: str = Depends(verify_api_key),
+):
+    """Get navigation steps for a job."""
+    from ..jobs import JobQueue
+
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if not queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+
+    steps = await queue.get_steps(job_id)
+
+    return {
+        "job_id": job_id,
+        "steps": [
+            {
+                "id": s.id,
+                "step_number": s.step_number,
+                "action": s.action,
+                "observation": s.observation,
+                "url": s.url,
+                "is_error": s.is_error,
+                "timestamp": s.timestamp.isoformat(),
+            }
+            for s in steps
+        ],
+    }
+
+
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    request: Request,
+    job_id: str,
+    limit: int = 500,
+    _api_key: str = Depends(verify_api_key),
+):
+    """Get logs for a job."""
+    from ..jobs import JobQueue
+
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if not queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+
+    logs = await queue.get_logs(job_id, limit)
+
+    return {
+        "job_id": job_id,
+        "logs": [
+            {
+                "id": l.id,
+                "timestamp": l.timestamp.isoformat(),
+                "level": l.level,
+                "source": l.source,
+                "message": l.message,
+            }
+            for l in logs
+        ],
+    }
+
+
 # =============================================================================
 # API Key Management
 # =============================================================================
@@ -424,6 +487,50 @@ async def delete_credential(
         raise HTTPException(status_code=404, detail="Credential not found")
 
     return {"status": "deleted", "name": name}
+
+
+# =============================================================================
+# Notes Endpoints
+# =============================================================================
+
+
+@router.get("/notes")
+async def get_notes(
+    request: Request,
+    domain: str | None = Query(default=None, description="Filter by domain"),
+    note_type: str | None = Query(default=None, description="Filter by type"),
+    _api_key: str = Depends(verify_api_key),
+):
+    """Get agent notes/learnings."""
+    from ..browser.notes import get_notes_db
+
+    notes_db = get_notes_db()
+
+    if domain:
+        notes = notes_db.get_notes_for_url(domain)
+    elif note_type:
+        notes = notes_db.get_notes_by_type(note_type)
+    else:
+        # Return all notes
+        notes = []
+        for domain_notes in notes_db._notes.values():
+            notes.extend(domain_notes)
+
+    return {
+        "notes": [
+            {
+                "domain": n.domain,
+                "note_type": n.note_type,
+                "content": n.content,
+                "label": n.label,
+                "url_pattern": n.url_pattern,
+                "success": n.success,
+                "created_at": n.created_at,
+                "use_count": n.use_count,
+            }
+            for n in notes
+        ],
+    }
 
 
 # =============================================================================

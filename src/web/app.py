@@ -216,7 +216,9 @@ async def startup_event():
         api_key = os.environ.get("GRABOID_API_KEY", "")
     if not api_key:
         api_key = generate_api_key()
-        logger.info("Generated new API key (set GRABOID_API_KEY env var to persist)")
+        logger.info(f"Generated new API key: {api_key}")
+        # Save to config file for persistence
+        _save_api_key_to_config(api_key)
     state.api_key = api_key
 
     # Make state accessible via app.state for API routes
@@ -387,6 +389,50 @@ def load_config_as_dict() -> dict[str, Any]:
         with open(path, "rb") as f:
             return tomllib.load(f)
     return {}
+
+
+def _save_api_key_to_config(api_key: str) -> None:
+    """Save API key to config file, preserving other settings."""
+    path = find_config_file() or CONFIG_SEARCH_PATHS[0]
+
+    # Load existing config or start fresh
+    config_dict = {}
+    if path.exists():
+        with open(path, "rb") as f:
+            config_dict = tomllib.load(f)
+
+    # Update api section
+    if "api" not in config_dict:
+        config_dict["api"] = {}
+    config_dict["api"]["api_key"] = api_key
+
+    # Write back as TOML
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for section, values in config_dict.items():
+            if isinstance(values, dict):
+                f.write(f"[{section}]\n")
+                for key, value in values.items():
+                    if isinstance(value, bool):
+                        f.write(f"{key} = {str(value).lower()}\n")
+                    elif isinstance(value, str):
+                        f.write(f'{key} = "{value}"\n')
+                    elif isinstance(value, list):
+                        items = ", ".join(f'"{v}"' if isinstance(v, str) else str(v) for v in value)
+                        f.write(f"{key} = [{items}]\n")
+                    else:
+                        f.write(f"{key} = {value}\n")
+                f.write("\n")
+            else:
+                # Top-level key
+                if isinstance(values, bool):
+                    f.write(f"{section} = {str(values).lower()}\n")
+                elif isinstance(values, str):
+                    f.write(f'{section} = "{values}"\n')
+                else:
+                    f.write(f"{section} = {values}\n")
+
+    logger.info(f"Saved API key to {path}")
 
 
 def save_config(data: dict[str, Any], path: Path | None = None):

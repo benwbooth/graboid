@@ -194,6 +194,9 @@ class TaskResult:
     error: str | None = None
     started_at: datetime = field(default_factory=datetime.now)
     completed_at: datetime | None = None
+    steps: list[Any] = field(default_factory=list)  # NavigationStep list
+    screenshots: list[tuple[bytes, str, str]] = field(default_factory=list)  # (data, url, description)
+    raw_output: str = ""
 
 
 class Graboid:
@@ -300,6 +303,7 @@ class Graboid:
         url: str,
         task: str,
         screenshot_callback: "Callable[[bytes, str, str], Any] | None" = None,
+        log_callback: "Callable[[str, str], Any] | None" = None,
     ) -> TaskResult:
         """
         Navigate to a URL and perform a task using browser automation.
@@ -308,6 +312,7 @@ class Graboid:
             url: Starting URL
             task: Description of what to do (e.g., "find download links for X")
             screenshot_callback: Optional callback for screenshots (data, url, description)
+            log_callback: Optional callback for log messages (message, level)
 
         Returns:
             TaskResult with found links and any downloads
@@ -321,6 +326,10 @@ class Graboid:
             if screenshot_callback:
                 agent.set_screenshot_callback(screenshot_callback)
 
+            # Set log callback if provided
+            if log_callback:
+                agent.set_log_callback(log_callback)
+
             nav_result = await agent.find_download_links(
                 url=url,
                 description=task,
@@ -330,10 +339,15 @@ class Graboid:
             result.success = nav_result.success
             result.found_links = nav_result.found_links
             result.error = nav_result.error
+            result.steps = nav_result.steps
+            result.screenshots = nav_result.screenshots
+            result.raw_output = nav_result.raw_output
 
-            # Clear callback after use
+            # Clear callbacks after use
             if screenshot_callback:
                 agent.set_screenshot_callback(None)
+            if log_callback:
+                agent.set_log_callback(None)
 
         except Exception as e:
             result.error = str(e)
@@ -383,6 +397,14 @@ class Graboid:
 
         try:
             manager = await self.get_torrent_manager()
+            await manager.initialize()
+
+            # Verify the client is reachable before queueing
+            if manager.client and not await manager.client.is_available():
+                raise RuntimeError(
+                    f"Torrent client ({self.config.torrent_client}) is not reachable"
+                )
+
             await manager.add_download(source, label or "graboid")
             await manager.start()
             result.success = True
