@@ -343,10 +343,10 @@ async function viewJob(jobId) {
                 <div>
                     <table style="width: 100%;">
                         <tr><td style="color: var(--text-dim); width: 120px;">ID</td><td><code>${job.id.substring(0, 8)}</code></td></tr>
-                        <tr><td style="color: var(--text-dim);">Status</td><td><span class="tag ${getStatusClass(job.status)}">${job.status}</span></td></tr>
-                        <tr><td style="color: var(--text-dim);">Phase</td><td>${job.current_phase}</td></tr>
-                        <tr><td style="color: var(--text-dim);">Progress</td><td>${Math.round(job.progress_percent)}%</td></tr>
-                        <tr><td style="color: var(--text-dim);">Updated</td><td>${new Date(job.updated_at).toLocaleString()}</td></tr>
+                        <tr><td style="color: var(--text-dim);">Status</td><td id="job-status"><span class="tag ${getStatusClass(job.status)}">${job.status}</span></td></tr>
+                        <tr><td style="color: var(--text-dim);">Phase</td><td id="job-phase">${job.current_phase}</td></tr>
+                        <tr><td style="color: var(--text-dim);">Progress</td><td id="job-progress">${Math.round(job.progress_percent)}%</td></tr>
+                        <tr><td style="color: var(--text-dim);">Updated</td><td id="job-updated">${new Date(job.updated_at).toLocaleString()}</td></tr>
                     </table>
 
                     <div style="margin-top: 1rem; padding: 0.75rem; background: var(--bg); border-radius: 0.25rem;">
@@ -354,7 +354,7 @@ async function viewJob(jobId) {
                         <div id="job-progress-message">${job.progress_message || 'Waiting...'}</div>
                     </div>
 
-                    ${job.error_message ? `<div class="alert error" style="margin-top: 1rem;">${escapeHtml(job.error_message)}</div>` : ''}
+                    <div id="job-error" class="alert error" style="margin-top: 1rem; ${job.error_message ? '' : 'display:none;'}">${job.error_message ? escapeHtml(job.error_message) : ''}</div>
 
                     <div style="margin-top: 1rem;">
                         <div style="color: var(--text-dim); font-size: 0.75rem; margin-bottom: 0.25rem;">Task</div>
@@ -389,26 +389,26 @@ async function viewJob(jobId) {
                 </div>
             </div>
 
-            ${job.found_urls && job.found_urls.length > 0 ? `
-                <h3 style="margin-top: 1.5rem;">Found URLs (${job.found_urls.length})</h3>
-                <ul style="margin-top: 0.5rem; padding-left: 1.5rem; max-height: 150px; overflow-y: auto;">
-                    ${job.found_urls.map(u => `<li style="word-break: break-all;"><a href="${u}" target="_blank" style="color: var(--accent);">${u}</a></li>`).join('')}
+            <div id="job-found-urls" style="${job.found_urls && job.found_urls.length > 0 ? '' : 'display:none;'}">
+                <h3 style="margin-top: 1.5rem;">Found URLs (<span id="job-found-urls-count">${(job.found_urls || []).length}</span>)</h3>
+                <ul id="job-found-urls-list" style="margin-top: 0.5rem; padding-left: 1.5rem; max-height: 150px; overflow-y: auto;">
+                    ${(job.found_urls || []).map(u => `<li style="word-break: break-all;"><a href="${u}" target="_blank" style="color: var(--accent);">${u}</a></li>`).join('')}
                 </ul>
-            ` : ''}
+            </div>
 
-            ${job.downloaded_files && job.downloaded_files.length > 0 ? `
-                <h3 style="margin-top: 1.5rem;">Downloaded Files (${job.downloaded_files.length})</h3>
-                <ul style="margin-top: 0.5rem; padding-left: 1.5rem;">
-                    ${job.downloaded_files.map(f => `<li style="word-break: break-all;"><code>${f}</code></li>`).join('')}
+            <div id="job-downloaded-files" style="${job.downloaded_files && job.downloaded_files.length > 0 ? '' : 'display:none;'}">
+                <h3 style="margin-top: 1.5rem;">Downloaded Files (<span id="job-downloaded-count">${(job.downloaded_files || []).length}</span>)</h3>
+                <ul id="job-downloaded-list" style="margin-top: 0.5rem; padding-left: 1.5rem;">
+                    ${(job.downloaded_files || []).map(f => `<li style="word-break: break-all;"><code>${f}</code></li>`).join('')}
                 </ul>
-            ` : ''}
+            </div>
 
-            ${job.final_paths && job.final_paths.length > 0 ? `
-                <h3 style="margin-top: 1.5rem;">Final Paths (${job.final_paths.length})</h3>
-                <ul style="margin-top: 0.5rem; padding-left: 1.5rem;">
-                    ${job.final_paths.map(f => `<li style="word-break: break-all;"><code>${f}</code></li>`).join('')}
+            <div id="job-final-paths" style="${job.final_paths && job.final_paths.length > 0 ? '' : 'display:none;'}">
+                <h3 style="margin-top: 1.5rem;">Final Paths (<span id="job-final-count">${(job.final_paths || []).length}</span>)</h3>
+                <ul id="job-final-list" style="margin-top: 0.5rem; padding-left: 1.5rem;">
+                    ${(job.final_paths || []).map(f => `<li style="word-break: break-all;"><code>${f}</code></li>`).join('')}
                 </ul>
-            ` : ''}
+            </div>
 
             <div style="margin-top: 1.5rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
@@ -514,22 +514,72 @@ async function refreshJobDetails(jobId) {
         });
         const job = await resp.json();
 
-        // Update progress message
+        // Update status fields
+        const statusEl = document.getElementById('job-status');
+        if (statusEl) statusEl.innerHTML = `<span class="tag ${getStatusClass(job.status)}">${job.status}</span>`;
+
+        const phaseEl = document.getElementById('job-phase');
+        if (phaseEl) phaseEl.textContent = job.current_phase;
+
+        const progressEl = document.getElementById('job-progress');
+        if (progressEl) progressEl.textContent = Math.round(job.progress_percent) + '%';
+
+        const updatedEl = document.getElementById('job-updated');
+        if (updatedEl) updatedEl.textContent = new Date(job.updated_at).toLocaleString();
+
         const msgEl = document.getElementById('job-progress-message');
-        if (msgEl) {
-            msgEl.textContent = job.progress_message || 'Waiting...';
+        if (msgEl) msgEl.textContent = job.progress_message || 'Waiting...';
+
+        // Update error
+        const errorEl = document.getElementById('job-error');
+        if (errorEl) {
+            if (job.error_message) {
+                errorEl.textContent = job.error_message;
+                errorEl.style.display = '';
+            } else {
+                errorEl.style.display = 'none';
+            }
         }
 
-        // Load latest screenshot, steps, and logs
+        // Update found URLs
+        const urlsContainer = document.getElementById('job-found-urls');
+        if (urlsContainer && job.found_urls && job.found_urls.length > 0) {
+            urlsContainer.style.display = '';
+            document.getElementById('job-found-urls-count').textContent = job.found_urls.length;
+            document.getElementById('job-found-urls-list').innerHTML = job.found_urls.map(u =>
+                `<li style="word-break: break-all;"><a href="${u}" target="_blank" style="color: var(--accent);">${u}</a></li>`
+            ).join('');
+        }
+
+        // Update downloaded files
+        const dlContainer = document.getElementById('job-downloaded-files');
+        if (dlContainer && job.downloaded_files && job.downloaded_files.length > 0) {
+            dlContainer.style.display = '';
+            document.getElementById('job-downloaded-count').textContent = job.downloaded_files.length;
+            document.getElementById('job-downloaded-list').innerHTML = job.downloaded_files.map(f =>
+                `<li style="word-break: break-all;"><code>${f}</code></li>`
+            ).join('');
+        }
+
+        // Update final paths
+        const fpContainer = document.getElementById('job-final-paths');
+        if (fpContainer && job.final_paths && job.final_paths.length > 0) {
+            fpContainer.style.display = '';
+            document.getElementById('job-final-count').textContent = job.final_paths.length;
+            document.getElementById('job-final-list').innerHTML = job.final_paths.map(f =>
+                `<li style="word-break: break-all;"><code>${f}</code></li>`
+            ).join('');
+        }
+
+        // Load latest screenshot, steps, logs, and notes
         await loadJobScreenshots(jobId);
         await loadJobSteps(jobId);
         await refreshLogs();
+        await loadNotes();
 
         // Stop refresh if job completed
         if (!isActive(job.status)) {
             stopScreenshotRefresh();
-            // Refresh the full view to show final state
-            viewJob(jobId);
         }
     } catch (err) {
         console.error('Failed to refresh job:', err);
