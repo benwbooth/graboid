@@ -403,6 +403,63 @@ async def get_job_logs(
     }
 
 
+@router.get("/jobs/{job_id}/logs/stream")
+async def stream_job_logs(
+    request: Request,
+    job_id: str,
+    _api_key: str = Depends(verify_api_key),
+):
+    """Stream job logs in real-time via Server-Sent Events."""
+    import asyncio
+    import json
+
+    from ..jobs import JobQueue, JobStatus
+
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if not queue:
+        raise HTTPException(status_code=503, detail="Job queue not initialized")
+
+    job = await queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    async def event_generator():
+        seen_ids: set[str] = set()
+        last_count = 0
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            logs = await queue.get_logs(job_id, 500)
+
+            for log in logs:
+                if log.id not in seen_ids:
+                    seen_ids.add(log.id)
+                    yield {
+                        "event": "log",
+                        "data": json.dumps({
+                            "id": log.id,
+                            "timestamp": log.timestamp.isoformat(),
+                            "level": log.level,
+                            "source": log.source,
+                            "message": log.message,
+                        }),
+                    }
+
+            # Check if job is done
+            current_job = await queue.get_job(job_id)
+            if current_job and current_job.status in (
+                JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.CANCELLED,
+            ):
+                yield {"event": "done", "data": "{}"}
+                break
+
+            await asyncio.sleep(0.5)
+
+    return EventSourceResponse(event_generator())
+
+
 # =============================================================================
 # API Key Management
 # =============================================================================
