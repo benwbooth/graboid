@@ -1,12 +1,3 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-.eggs/
-*.egg-info/
-
 # Research output
 research_output/
 
@@ -18,3 +9,8 @@ research_output/
 # OS
 .DS_Store
 config.toml
+
+# Rust rewrite
+graboid-rs/target/
+graboid-rs-data/
+graboid-rs/graboid-rs-data/

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Agent Notes - Graboid{% endblock %}
+
+{% block content %}
+<h1>Agent Notes</h1>
+
+<div class="grid">
+    <div class="card">
+        <h2>Statistics</h2>
+        <table>
+            <tr>
+                <td style="color: var(--text-dim);">Total Notes</td>
+                <td>{{ stats.total_notes }}</td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-dim);">Domains</td>
+                <td>{{ stats.domains }}</td>
+            </tr>
+            <tr>
+                <td style="color: var(--text-dim);">Successful Sources</td>
+                <td>{{ stats.successful }}</td>
+            </tr>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Notes by Type</h2>
+        {% if stats.by_type %}
+        <table>
+            {% for note_type, count in stats.by_type.items() %}
+            <tr>
+                <td style="color: var(--text-dim);">{{ note_type | replace('_', ' ') }}</td>
+                <td>{{ count }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <p style="color: var(--text-dim);">No notes recorded yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+{% if domains %}
+<div class="card">
+    <h2>Notes by Domain</h2>
+
+    {% for domain in domains %}
+    <details style="margin-bottom: 1rem;">
+        <summary style="cursor: pointer; padding: 0.75rem; background: var(--bg); border-radius: 0.25rem; margin-bottom: 0.5rem;">
+            <strong style="color: var(--accent);">{{ domain }}</strong>
+            <span style="color: var(--text-dim); margin-left: 0.5rem;">
+                ({{ domain_notes[domain] | length }} notes)
+            </span>
+        </summary>
+
+        <table style="margin-left: 1rem;">
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Label</th>
+                    <th>Content</th>
+                    <th>Success</th>
+                    <th>Uses</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for note in domain_notes[domain] %}
+                <tr>
+                    <td>
+                        <span class="tag">{{ note.note_type | replace('_', ' ') }}</span>
+                    </td>
+                    <td>{{ note.label or '-' }}</td>
+                    <td style="max-width: 400px; overflow: hidden; text-overflow: ellipsis;">
+                        {{ note.content }}
+                    </td>
+                    <td>
+                        {% if note.success is true %}
+                        <span class="tag success">Yes</span>
+                        {% elif note.success is false %}
+                        <span class="tag error">No</span>
+                        {% else %}
+                        <span style="color: var(--text-dim);">-</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ note.use_count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </details>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card">
+    <h2>No Notes Yet</h2>
+    <p style="color: var(--text-dim);">
+        Agent notes will appear here as the browser agent learns about different sites.
+        Run a download to start building the knowledge base.
+    </p>
+</div>
+{% endif %}
+{% endblock %}
