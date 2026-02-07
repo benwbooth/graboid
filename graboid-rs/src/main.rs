@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -72,7 +73,17 @@ async fn main() -> Result<()> {
         api_key: Arc::new(tokio::sync::RwLock::new(config.api_key.clone())),
     });
 
-    let app = api::router(state);
+    let frontend_dist = project_root.join("frontend/dist");
+    let app = if frontend_dist.exists() {
+        info!("serving frontend assets from {}", frontend_dist.display());
+        api::router(state).nest_service("/assets", ServeDir::new(frontend_dist))
+    } else {
+        warn!(
+            "frontend dist missing at {}; /assets will not be served",
+            frontend_dist.display()
+        );
+        api::router(state)
+    };
 
     let addr: SocketAddr = config
         .bind_addr

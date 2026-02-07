@@ -706,6 +706,7 @@ fn render_document(
             </head>
             <body>
                 {body}
+                <script type="module" src="/assets/graboid_frontend.js"></script>
             </body>
         </html>
     }

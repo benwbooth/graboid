@@ -34,7 +34,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$PROJECT_DIR
-ExecStart=$NIX_BIN develop --command watchexec -r -w $RUST_DIR/src -w $RUST_DIR/Cargo.toml -w $RUST_DIR/templates -w $PROJECT_DIR/config.toml -- env GRABOID_RS_BIND_ADDR=$BIND_ADDR cargo run --manifest-path $RUST_DIR/Cargo.toml
+ExecStart=$NIX_BIN develop --command watchexec -r -w $RUST_DIR/src -w $RUST_DIR/Cargo.toml -w $RUST_DIR/build.rs -w $RUST_DIR/frontend/src -w $RUST_DIR/frontend/Cargo.toml -w $RUST_DIR/frontend/index.html -w $RUST_DIR/frontend/Trunk.toml -w $PROJECT_DIR/config.toml -- /run/current-system/sw/bin/bash -lc 'set -euo pipefail; cd "$RUST_DIR/frontend"; NO_COLOR=false trunk build --config Trunk.toml; cd "$PROJECT_DIR"; env GRABOID_RS_BIND_ADDR=$BIND_ADDR cargo run --manifest-path "$RUST_DIR/Cargo.toml"'
 Restart=on-failure
 RestartSec=1
 

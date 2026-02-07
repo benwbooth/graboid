@@ -78,56 +78,27 @@ fn capture_backend_stamp() -> BuildStamp {
 }
 
 fn capture_frontend_stamp(project_root: &Path) -> BuildStamp {
-    let mut files = collect_frontend_files(project_root);
-    files.sort();
-    files.dedup();
-
-    if files.is_empty() {
-        let now = Local::now();
-        return BuildStamp {
-            hash: "unknown".to_string(),
-            timestamp: now.format("%Y-%m-%d %H:%M:%S").to_string(),
-            tz: format_tz_abbrev(now),
-            epoch: now.timestamp(),
-        };
+    let mut wasm_files = collect_frontend_wasm_files(project_root);
+    wasm_files.sort();
+    wasm_files.dedup();
+    if let Some(stamp) = stamp_from_files(project_root, &wasm_files, None) {
+        return stamp;
     }
 
-    let mut hasher = Sha256::new();
-    let mut latest_mtime: Option<DateTime<Local>> = None;
-
-    for path in &files {
-        let rel = path.strip_prefix(project_root).unwrap_or(path.as_path());
-        hasher.update(rel.to_string_lossy().as_bytes());
-        hasher.update([0_u8]);
-
-        if let Ok(bytes) = std::fs::read(path) {
-            hasher.update(&bytes);
-            hasher.update([0_u8]);
-        }
-
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(modified) = meta.modified() {
-                let modified_local: DateTime<Local> = DateTime::from(modified);
-                if latest_mtime
-                    .as_ref()
-                    .map(|current| modified_local > *current)
-                    .unwrap_or(true)
-                {
-                    latest_mtime = Some(modified_local);
-                }
-            }
-        }
+    // No FE wasm artifact was found (SSR-only build). Show a deterministic FE stamp
+    // based on frontend source assets rather than "unknown".
+    let mut src_files = collect_frontend_source_files(project_root);
+    src_files.sort();
+    src_files.dedup();
+    if let Some(stamp) = stamp_from_files(project_root, &src_files, Some("ssr-")) {
+        return stamp;
     }
-
-    let digest_hex = format!("{:x}", hasher.finalize());
-    let short_hash = digest_hex.chars().take(8).collect::<String>();
-    let built_at = latest_mtime.unwrap_or_else(Local::now);
 
     BuildStamp {
-        hash: short_hash,
-        timestamp: built_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-        tz: format_tz_abbrev(built_at),
-        epoch: built_at.timestamp(),
+        hash: "unknown".to_string(),
+        timestamp: "-".to_string(),
+        tz: "-".to_string(),
+        epoch: 0,
     }
 }
 
@@ -158,7 +129,56 @@ fn is_human_tz_abbrev(value: &str) -> bool {
     !trimmed.is_empty() && trimmed.len() <= 6 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic())
 }
 
-fn collect_frontend_files(project_root: &Path) -> Vec<PathBuf> {
+fn collect_frontend_wasm_files(project_root: &Path) -> Vec<PathBuf> {
+    let candidates = [
+        project_root.join("target/site/pkg"),
+        project_root.join("target/site"),
+        project_root.join("target/pkg"),
+        project_root.join("dist"),
+        project_root.join("pkg"),
+        project_root.join("frontend/dist"),
+        project_root.join("frontend/dist/pkg"),
+    ];
+
+    let mut files = Vec::new();
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        if candidate.is_file() {
+            if candidate
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+                .unwrap_or(false)
+            {
+                files.push(candidate);
+            }
+            continue;
+        }
+
+        files.extend(
+            WalkDir::new(candidate)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("wasm"))
+                        .unwrap_or(false)
+                })
+                .map(|entry| entry.path().to_path_buf()),
+        );
+    }
+
+    files
+}
+
+fn collect_frontend_source_files(project_root: &Path) -> Vec<PathBuf> {
     let candidates = [
         project_root.join("src/ui.rs"),
         project_root.join("src/ui"),
@@ -186,6 +206,64 @@ fn collect_frontend_files(project_root: &Path) -> Vec<PathBuf> {
     }
 
     files
+}
+
+fn stamp_from_files(
+    project_root: &Path,
+    files: &[PathBuf],
+    hash_prefix: Option<&str>,
+) -> Option<BuildStamp> {
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    let mut latest_mtime: Option<DateTime<Local>> = None;
+    let mut seen_any_file = false;
+
+    for path in files {
+        let rel = path.strip_prefix(project_root).unwrap_or(path.as_path());
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update([0_u8]);
+
+        if let Ok(bytes) = std::fs::read(path) {
+            seen_any_file = true;
+            hasher.update(&bytes);
+            hasher.update([0_u8]);
+        }
+
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(modified) = meta.modified() {
+                let modified_local: DateTime<Local> = DateTime::from(modified);
+                if latest_mtime
+                    .as_ref()
+                    .map(|current| modified_local > *current)
+                    .unwrap_or(true)
+                {
+                    latest_mtime = Some(modified_local);
+                }
+            }
+        }
+    }
+
+    if !seen_any_file {
+        return None;
+    }
+
+    let digest_hex = format!("{:x}", hasher.finalize());
+    let short_hash = digest_hex.chars().take(8).collect::<String>();
+    let built_at = latest_mtime.unwrap_or_else(Local::now);
+    let hash = match hash_prefix {
+        Some(prefix) => format!("{prefix}{short_hash}"),
+        None => short_hash,
+    };
+
+    Some(BuildStamp {
+        hash,
+        timestamp: built_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        tz: format_tz_abbrev(built_at),
+        epoch: built_at.timestamp(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]

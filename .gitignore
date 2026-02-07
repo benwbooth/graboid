@@ -12,6 +12,9 @@ config.toml
 
 # Rust rewrite
 graboid-rs/target/
+graboid-rs/frontend/dist/
+graboid-rs/frontend/.trunk/
+graboid-rs/frontend/target/
 graboid-rs-data/
 graboid-rs/graboid-rs-data/
 downloads/

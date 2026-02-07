@@ -71,8 +71,9 @@ impl BrowserBackend {
 
 const CHROME_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_STARTUP_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
-const CLAUDE_IDLE_SILENCE_TIMEOUT: Duration = Duration::from_secs(180);
+const CLAUDE_IDLE_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLAUDE_WAITING_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const CLAUDE_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(20);
 
 pub async fn run_navigation(
     job_id: &str,
@@ -340,6 +341,7 @@ async fn run_claude_session(
     let mut raw_output = String::new();
     let mut stream_connected = false;
     let mut startup_waited = 0_u64;
+    let mut last_output_at = Instant::now();
 
     let timeout = tokio::time::sleep(Duration::from_secs(cfg.claude_timeout_seconds));
     tokio::pin!(timeout);
@@ -350,6 +352,9 @@ async fn run_claude_session(
     let mut startup_tick = tokio::time::interval(CLAUDE_WAITING_LOG_INTERVAL);
     startup_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     startup_tick.tick().await;
+    let mut idle_tick = tokio::time::interval(CLAUDE_IDLE_LOG_INTERVAL);
+    idle_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    idle_tick.tick().await;
 
     loop {
         tokio::select! {
@@ -379,6 +384,16 @@ async fn run_claude_session(
                         "Waiting for Claude MCP startup ({}s)",
                         startup_waited
                     ),
+                });
+            }
+            _ = idle_tick.tick(), if stream_connected => {
+                let idle_secs = Instant::now()
+                    .saturating_duration_since(last_output_at)
+                    .as_secs();
+                let _ = nav_tx.send(NavEvent::Log {
+                    level: "INFO".to_string(),
+                    source: "claude".to_string(),
+                    message: format!("Waiting for Claude output ({idle_secs}s idle)"),
                 });
             }
             _ = &mut silence_timeout => {
@@ -419,12 +434,14 @@ async fn run_claude_session(
 
                         if reached_stream && !stream_connected {
                             stream_connected = true;
+                            last_output_at = Instant::now();
                             let _ = nav_tx.send(NavEvent::Progress {
                                 percent: 20.0,
                                 message: "Claude stream connected".to_string(),
                             });
                             silence_timeout.as_mut().reset(Instant::now() + CLAUDE_IDLE_SILENCE_TIMEOUT);
                         } else if stream_connected {
+                            last_output_at = Instant::now();
                             silence_timeout
                                 .as_mut()
                                 .reset(Instant::now() + CLAUDE_IDLE_SILENCE_TIMEOUT);
@@ -748,7 +765,10 @@ fn build_prompt(
          Navigate to {} and complete this task:\n{}\n\n\
          REQUIREMENTS:\n\
          - {} \n\
+         - Use targeted page search with evaluate_script (querySelectorAll on links/buttons) before broad snapshots.\n\
+         - Avoid repeated identical tool calls; if one approach fails, switch strategy immediately.\n\
          - When you find a downloadable link, emit: [DOWNLOAD] URL: <url>\n\
+         - Once at least one viable download URL is found, stop exploring and finish unless the user explicitly requested exhaustive source comparison.\n\
          - Emit clear progress while navigating.\n\
          - End with [RESULT] SUCCESS: true/false\n\
          - If blocked, emit: [ERROR] PROBLEM: <description>\n\n\

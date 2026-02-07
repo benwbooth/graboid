@@ -46,6 +46,10 @@
             cmake
             watchexec
             sqlite
+            trunk
+            wasm-bindgen-cli
+            binaryen
+            llvmPackages.lld
             nodejs_22
             chromium
             deluge

@@ -199,7 +199,7 @@ impl JobRunner {
                 .run_navigation_attempt(&mut job, &prompt, credential.clone())
                 .await
             {
-                Ok(outcome) => outcome,
+                Ok(outcome) => Some(outcome),
                 Err(err) => {
                     let err_text = err.to_string();
                     let fatal_step_budget = err_text.contains("Step budget exceeded");
@@ -213,24 +213,38 @@ impl JobRunner {
                     )
                     .await?;
 
-                    if browse_attempt < MAX_BROWSE_ATTEMPTS && !fatal_step_budget {
+                    if !job.found_urls.is_empty() {
+                        self.log(
+                            &job.id,
+                            "WARNING",
+                            "browse",
+                            &format!(
+                                "Proceeding with {} discovered URL(s) despite browse error",
+                                job.found_urls.len()
+                            ),
+                        )
+                        .await?;
+                        None
+                    } else if browse_attempt < MAX_BROWSE_ATTEMPTS && !fatal_step_budget {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
+                    } else {
+                        job.fail(format!(
+                            "Browse failed after {MAX_BROWSE_ATTEMPTS} attempts: {err}"
+                        ));
+                        self.persist_job(&job).await?;
+                        self.log(&job.id, "ERROR", "browse", &job.error_message)
+                            .await?;
+                        self.set_runtime_status(false, String::new()).await;
+                        return Ok(());
                     }
-
-                    job.fail(format!(
-                        "Browse failed after {MAX_BROWSE_ATTEMPTS} attempts: {err}"
-                    ));
-                    self.persist_job(&job).await?;
-                    self.log(&job.id, "ERROR", "browse", &job.error_message)
-                        .await?;
-                    self.set_runtime_status(false, String::new()).await;
-                    return Ok(());
                 }
             };
 
-            self.apply_navigation_outcome(&mut job, &navigation).await?;
-            self.persist_job(&job).await?;
+            if let Some(navigation) = navigation {
+                self.apply_navigation_outcome(&mut job, &navigation).await?;
+                self.persist_job(&job).await?;
+            }
 
             if job.downloaded_files.is_empty() && job.found_urls.is_empty() {
                 if browse_attempt < MAX_BROWSE_ATTEMPTS {
