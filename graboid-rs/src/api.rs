@@ -28,7 +28,7 @@ use crate::config::{
     generate_api_key, load_config_flat_json, persist_api_key, persist_flat_config,
 };
 use crate::events::ServerEvent;
-use crate::models::{CreateJobRequest, Job, JobListResponse, JobStatus};
+use crate::models::{CreateJobRequest, Job, JobListResponse, JobStatus, JobStepDetail};
 use crate::state::AppState;
 use crate::torrent;
 use crate::ui::{self, RequestContext};
@@ -47,6 +47,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/notes", get(notes_page))
         .route("/browser", get(browser_page))
         .route("/jobs", get(jobs_page))
+        .route("/jobs/{job_id}", get(job_detail_page))
+        .route("/jobs/submit", post(submit_job_form))
+        .route("/jobs/{job_id}/cancel", post(cancel_job_form))
+        .route("/jobs/{job_id}/requeue", post(requeue_job_form))
         .route("/ws", get(ws_upgrade))
         .route("/api/status", get(api_status))
         .route("/api/test/torrent", post(api_test_torrent))
@@ -146,11 +150,10 @@ async fn index_page(
     if current_user(&jar, &state).is_none() {
         return Ok(Redirect::to("/login").into_response());
     }
-    let (is_running, current_task, _downloads, _message_count) =
-        state.runtime.snapshot_status().await;
+    let runtime = runtime_badge(&state).await;
 
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_index_page(&request, &state.git_info, is_running, &current_task);
+    let page = ui::render_index_page(&request, &state.git_info, &runtime);
     Ok(Html(page).into_response())
 }
 
@@ -166,10 +169,12 @@ async fn config_page(
     }
 
     let config_map = load_config_flat_json(&state.config_path);
+    let runtime = runtime_badge(&state).await;
     let request = request_context(&uri, &headers, &query);
     let page = ui::render_config_page(
         &request,
         &state.git_info,
+        &runtime,
         &config_map,
         &state.config_path.display().to_string(),
     );
@@ -341,8 +346,16 @@ async fn notes_page(
         domain_notes.insert(domain.clone(), notes);
     }
 
+    let runtime = runtime_badge(&state).await;
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_notes_page(&request, &state.git_info, &stats, &domains, &domain_notes);
+    let page = ui::render_notes_page(
+        &request,
+        &state.git_info,
+        &runtime,
+        &stats,
+        &domains,
+        &domain_notes,
+    );
     Ok(Html(page).into_response())
 }
 
@@ -356,8 +369,11 @@ async fn browser_page(
     if current_user(&jar, &state).is_none() {
         return Ok(Redirect::to("/login").into_response());
     }
+    let runtime = runtime_badge(&state).await;
+    let screenshot = state.runtime.screenshot().await;
+    let messages = state.runtime.messages_tail(120).await;
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_browser_page(&request, &state.git_info);
+    let page = ui::render_browser_page(&request, &state.git_info, &runtime, screenshot, &messages);
     Ok(Html(page).into_response())
 }
 
@@ -372,10 +388,181 @@ async fn jobs_page(
         return Ok(Redirect::to("/login").into_response());
     }
 
+    let offset = query
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+
+    let jobs = state.db.list_jobs(None, limit, offset).await?;
+    let total = state.db.count_jobs(None).await?;
     let api_key = state.api_key.read().await.clone();
+    let runtime = runtime_badge(&state).await;
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_jobs_page(&request, &state.git_info, &api_key);
+    let page = ui::render_jobs_page(
+        &request,
+        &state.git_info,
+        &runtime,
+        &api_key,
+        &jobs,
+        total,
+        offset,
+        limit,
+        query.get("msg").map(String::as_str),
+    );
     Ok(Html(page).into_response())
+}
+
+async fn job_detail_page(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(job_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Ok(Redirect::to("/login").into_response());
+    }
+
+    let Some(job) = state.db.get_job(&job_id).await? else {
+        return Ok(Redirect::to("/jobs?msg=error:not-found").into_response());
+    };
+
+    let steps = build_job_step_details(&state, &job_id).await?;
+    let logs = state.db.list_logs(&job_id, 500).await?;
+    let api_key = state.api_key.read().await.clone();
+    let runtime = runtime_badge(&state).await;
+    let request = request_context(&uri, &headers, &query);
+
+    let page = ui::render_job_detail_page(
+        &request,
+        &state.git_info,
+        &runtime,
+        &api_key,
+        &job,
+        &steps,
+        &logs,
+    );
+    Ok(Html(page).into_response())
+}
+
+async fn submit_job_form(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Ok(Redirect::to("/login").into_response());
+    }
+
+    let prompt = form.get("prompt").map(|v| v.trim()).unwrap_or_default();
+    if prompt.is_empty() {
+        return Ok(Redirect::to("/jobs?msg=error:prompt-required").into_response());
+    }
+
+    let source_url = form
+        .get("source_url")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let destination_path = form
+        .get("destination_path")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let file_operation = form
+        .get("file_operation")
+        .cloned()
+        .unwrap_or_else(|| "copy".to_string());
+    let priority = form
+        .get("priority")
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(0);
+    let file_filter = form
+        .get("file_filter")
+        .map(|raw| {
+            raw.lines()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let payload = CreateJobRequest {
+        prompt: prompt.to_string(),
+        source_url,
+        credential_name: None,
+        file_filter,
+        destination_path,
+        file_operation,
+        priority,
+        metadata: Value::Object(Default::default()),
+    };
+
+    let job = Job::new(payload, &state.config.download_dir);
+    state.db.create_job(&job).await?;
+    state.runner.enqueue(job.id.clone()).await?;
+    let _ = state.events.send(ServerEvent::JobUpdate(job));
+
+    Ok(Redirect::to("/jobs?msg=submitted").into_response())
+}
+
+async fn cancel_job_form(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(job_id): Path<String>,
+) -> Result<Response, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Ok(Redirect::to("/login").into_response());
+    }
+
+    let cancelled = state.runner.cancel(&job_id).await?;
+    if cancelled {
+        Ok(Redirect::to("/jobs?msg=cancelled").into_response())
+    } else {
+        Ok(Redirect::to("/jobs?msg=error:not-found").into_response())
+    }
+}
+
+async fn requeue_job_form(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(job_id): Path<String>,
+) -> Result<Response, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Ok(Redirect::to("/login").into_response());
+    }
+
+    let Some(original) = state.db.get_job(&job_id).await? else {
+        return Ok(Redirect::to("/jobs?msg=error:not-found").into_response());
+    };
+
+    let payload = CreateJobRequest {
+        prompt: original.prompt,
+        source_url: original.source_url,
+        credential_name: original.credential_name,
+        file_filter: original.file_filter,
+        destination_path: original.destination_path,
+        file_operation: original.file_operation,
+        priority: original.priority,
+        metadata: original.metadata,
+    };
+
+    let job = Job::new(payload, &state.config.download_dir);
+    state.db.create_job(&job).await?;
+    state.runner.enqueue(job.id.clone()).await?;
+    let _ = state.events.send(ServerEvent::JobUpdate(job));
+
+    Ok(Redirect::to("/jobs?msg=requeued").into_response())
 }
 
 async fn api_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
@@ -806,7 +993,7 @@ async fn list_jobs(
         .status
         .as_deref()
         .and_then(|s| s.parse::<JobStatus>().ok());
-    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let limit = query.limit.unwrap_or(50).clamp(1, 1000);
     let offset = query.offset.unwrap_or(0).max(0);
 
     let jobs = state.db.list_jobs(status, limit, offset).await?;
@@ -984,10 +1171,17 @@ async fn get_job_steps_detail(
     Query(query): Query<ApiKeyQuery>,
 ) -> Result<Json<Value>, ApiError> {
     verify_api_key(&headers, query.api_key.as_deref(), &state).await?;
+    let detail = build_job_step_details(&state, &job_id).await?;
+    Ok(Json(json!({"steps": detail})))
+}
 
-    let steps = state.db.list_steps(&job_id).await?;
-    let screenshots = state.db.list_screenshots(&job_id).await?;
-    let logs = state.db.list_logs(&job_id, 500).await?;
+async fn build_job_step_details(
+    state: &Arc<AppState>,
+    job_id: &str,
+) -> Result<Vec<JobStepDetail>, ApiError> {
+    let steps = state.db.list_steps(job_id).await?;
+    let screenshots = state.db.list_screenshots(job_id).await?;
+    let logs = state.db.list_logs(job_id, 500).await?;
 
     let mut screenshot_by_step = HashMap::<i64, String>::new();
     for shot in screenshots {
@@ -1003,19 +1197,59 @@ async fn get_job_steps_detail(
         "site_structure",
     ]);
     let learning_logs = logs
-        .into_iter()
+        .iter()
         .filter(|log| log.source == "learning")
         .filter(|log| {
             extract_learning_type(&log.message)
                 .map(|kind| actionable_types.contains(kind.as_str()))
                 .unwrap_or(false)
         })
+        .cloned()
         .collect::<Vec<_>>();
+
+    let mut claude_messages_by_step = HashMap::<i64, Vec<String>>::new();
+    if !steps.is_empty() {
+        let mut step_idx = 0usize;
+        let first_step_time = steps[0].timestamp;
+
+        for log in logs
+            .iter()
+            .filter(|log| log.source == "claude_output" || log.source == "claude")
+        {
+            if log.timestamp < first_step_time {
+                continue;
+            }
+
+            while step_idx + 1 < steps.len() && steps[step_idx + 1].timestamp <= log.timestamp {
+                step_idx += 1;
+            }
+
+            let message = truncate(log.message.trim(), 240);
+            if message.trim().is_empty() {
+                continue;
+            }
+            claude_messages_by_step
+                .entry(steps[step_idx].step_number)
+                .or_default()
+                .push(message);
+        }
+    }
+
+    for lines in claude_messages_by_step.values_mut() {
+        dedupe_preserve_order(lines);
+        if lines.len() > 8 {
+            let keep_from = lines.len() - 8;
+            lines.drain(0..keep_from);
+        }
+    }
 
     let detail = steps
         .into_iter()
         .map(|step| {
             let mut notes = step.notes.clone();
+            let claude_messages = claude_messages_by_step
+                .remove(&step.step_number)
+                .unwrap_or_default();
 
             for learning in &learning_logs {
                 let delta = (learning.timestamp - step.timestamp).num_seconds().abs();
@@ -1026,25 +1260,21 @@ async fn get_job_steps_detail(
 
             dedupe_preserve_order(&mut notes);
 
-            let screenshot = screenshot_by_step
-                .get(&step.step_number)
-                .cloned()
-                .map(Value::String)
-                .unwrap_or(Value::Null);
-            json!({
-                "step_number": step.step_number,
-                "action": step.action,
-                "observation": step.observation,
-                "url": step.url,
-                "timestamp": step.timestamp,
-                "is_error": step.is_error,
-                "screenshot_base64": screenshot,
-                "notes": notes,
-            })
+            JobStepDetail {
+                step_number: step.step_number,
+                action: step.action,
+                observation: step.observation,
+                url: step.url,
+                timestamp: step.timestamp,
+                is_error: step.is_error,
+                screenshot_base64: screenshot_by_step.get(&step.step_number).cloned(),
+                notes,
+                claude_messages,
+            }
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(json!({"steps": detail})))
+    Ok(detail)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1339,6 +1569,15 @@ fn current_user(jar: &CookieJar, state: &AppState) -> Option<String> {
         &state.auth.session_secret,
         state.auth.session_max_age_seconds,
     )
+}
+
+async fn runtime_badge(state: &AppState) -> ui::RuntimeBadge {
+    let (is_running, current_task, _downloads, _message_count) =
+        state.runtime.snapshot_status().await;
+    ui::RuntimeBadge {
+        is_running,
+        current_task,
+    }
 }
 
 fn sign_session_token(username: &str, secret: &str) -> String {

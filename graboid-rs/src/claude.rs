@@ -26,6 +26,9 @@ pub enum NavEvent {
         percent: f64,
         message: String,
     },
+    FoundUrl {
+        url: String,
+    },
     Step {
         step_number: i64,
         action: String,
@@ -306,7 +309,7 @@ async fn run_claude_session(
         .arg("--verbose")
         .arg("--no-session-persistence")
         .arg("--disallowed-tools")
-        .arg("Bash,Read,Write,Edit,Task")
+        .arg("Bash,Read,Write,Edit,Task,Grep")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -515,6 +518,9 @@ fn handle_claude_line(
                             }
                             "text" => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    for url in parse_download_links(text) {
+                                        let _ = nav_tx.send(NavEvent::FoundUrl { url });
+                                    }
                                     raw_output.push_str(text);
                                     raw_output.push('\n');
                                     for line in text.lines() {
@@ -539,6 +545,9 @@ fn handle_claude_line(
             "result" => {
                 stream_connected = true;
                 if let Some(result) = value.get("result").and_then(Value::as_str) {
+                    for url in parse_download_links(result) {
+                        let _ = nav_tx.send(NavEvent::FoundUrl { url });
+                    }
                     raw_output.push_str(result);
                     raw_output.push('\n');
                 }
@@ -769,6 +778,8 @@ async fn start_chrome(job_id: &str, cfg: &AppConfig, download_dir: &Path) -> Res
             "--download-default-directory={}",
             download_dir.display()
         ))
+        // Keep source snapshots readable without excessive memory cost.
+        .arg("--window-size=1280,1024")
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-extensions")

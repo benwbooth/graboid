@@ -11,7 +11,6 @@ mod torrent;
 mod ui;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -54,8 +53,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    let template_root = resolve_template_root();
-    let git_info = GitInfo::capture(&template_root);
+    let project_root = resolve_project_root();
+    let git_info = GitInfo::capture(&project_root);
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -94,22 +93,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_template_root() -> PathBuf {
+fn resolve_project_root() -> std::path::PathBuf {
     let candidates = [
-        PathBuf::from("templates"),
-        PathBuf::from("graboid-rs/templates"),
-        PathBuf::from("../graboid-rs/templates"),
-        PathBuf::from("../templates"),
-        PathBuf::from("../../graboid-rs/templates"),
+        std::path::PathBuf::from("."),
+        std::path::PathBuf::from("graboid-rs"),
+        std::path::PathBuf::from("../graboid-rs"),
+        std::path::PathBuf::from("../../graboid-rs"),
     ];
 
     for candidate in candidates {
-        if candidate.exists() {
+        if candidate.join("src/ui.rs").exists() {
             return candidate;
         }
     }
 
-    PathBuf::from("templates")
+    std::path::PathBuf::from(".")
 }
 
 fn init_tracing() {

@@ -15,6 +15,11 @@ fn main() {
     println!("cargo:rustc-env=BUILD_HASH={hash}");
     println!("cargo:rustc-env=BUILD_EPOCH={epoch}");
 
+    // Recompute backend build stamp whenever Rust sources or manifest change.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=build.rs");
+
     // Support both workspace-root and crate-local git metadata paths.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");

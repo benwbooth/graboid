@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -49,10 +50,10 @@ pub struct BuildStamp {
 }
 
 impl GitInfo {
-    pub fn capture(template_root: &Path) -> Self {
+    pub fn capture(project_root: &Path) -> Self {
         Self {
             backend: capture_backend_stamp(),
-            frontend: capture_frontend_stamp(template_root),
+            frontend: capture_frontend_stamp(project_root),
         }
     }
 }
@@ -71,26 +72,22 @@ fn capture_backend_stamp() -> BuildStamp {
     BuildStamp {
         hash,
         timestamp: built_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-        tz: built_at.format("%Z").to_string(),
+        tz: format_tz_abbrev(built_at),
         epoch: built_at.timestamp(),
     }
 }
 
-fn capture_frontend_stamp(template_root: &Path) -> BuildStamp {
-    let mut files = WalkDir::new(template_root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.path().to_path_buf())
-        .collect::<Vec<_>>();
+fn capture_frontend_stamp(project_root: &Path) -> BuildStamp {
+    let mut files = collect_frontend_files(project_root);
     files.sort();
+    files.dedup();
 
     if files.is_empty() {
         let now = Local::now();
         return BuildStamp {
             hash: "unknown".to_string(),
             timestamp: now.format("%Y-%m-%d %H:%M:%S").to_string(),
-            tz: now.format("%Z").to_string(),
+            tz: format_tz_abbrev(now),
             epoch: now.timestamp(),
         };
     }
@@ -99,7 +96,7 @@ fn capture_frontend_stamp(template_root: &Path) -> BuildStamp {
     let mut latest_mtime: Option<DateTime<Local>> = None;
 
     for path in &files {
-        let rel = path.strip_prefix(template_root).unwrap_or(path.as_path());
+        let rel = path.strip_prefix(project_root).unwrap_or(path.as_path());
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update([0_u8]);
 
@@ -129,9 +126,66 @@ fn capture_frontend_stamp(template_root: &Path) -> BuildStamp {
     BuildStamp {
         hash: short_hash,
         timestamp: built_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-        tz: built_at.format("%Z").to_string(),
+        tz: format_tz_abbrev(built_at),
         epoch: built_at.timestamp(),
     }
+}
+
+fn format_tz_abbrev(local_dt: DateTime<Local>) -> String {
+    let fallback = local_dt.format("%Z").to_string();
+    if is_human_tz_abbrev(&fallback) {
+        return fallback;
+    }
+
+    if let Ok(zone_name) = iana_time_zone::get_timezone() {
+        if let Ok(tz) = zone_name.parse::<Tz>() {
+            let tz_abbrev = local_dt
+                .with_timezone(&Utc)
+                .with_timezone(&tz)
+                .format("%Z")
+                .to_string();
+            if is_human_tz_abbrev(&tz_abbrev) {
+                return tz_abbrev;
+            }
+        }
+    }
+
+    fallback
+}
+
+fn is_human_tz_abbrev(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed.len() <= 6 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+fn collect_frontend_files(project_root: &Path) -> Vec<PathBuf> {
+    let candidates = [
+        project_root.join("src/ui.rs"),
+        project_root.join("src/ui"),
+        project_root.join("src/ui_assets"),
+    ];
+
+    let mut files = Vec::new();
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        if candidate.is_file() {
+            files.push(candidate);
+            continue;
+        }
+
+        files.extend(
+            WalkDir::new(candidate)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| entry.path().to_path_buf()),
+        );
+    }
+
+    files
 }
 
 #[derive(Debug, Clone, Serialize)]

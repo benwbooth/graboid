@@ -14,3 +14,4 @@ config.toml
 graboid-rs/target/
 graboid-rs-data/
 graboid-rs/graboid-rs-data/
+downloads/

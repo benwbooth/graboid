@@ -246,6 +246,19 @@ pub struct JobScreenshotEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStepDetail {
+    pub step_number: i64,
+    pub action: String,
+    pub observation: String,
+    pub url: String,
+    pub timestamp: DateTime<Utc>,
+    pub is_error: bool,
+    pub screenshot_base64: Option<String>,
+    pub notes: Vec<String>,
+    pub claude_messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NoteEntry {
     pub id: i64,
     pub domain: String,

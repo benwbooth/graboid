@@ -343,7 +343,7 @@ impl JobDb {
     ) -> Result<Vec<Job>> {
         let rows = if let Some(status) = status {
             sqlx::query(
-                "SELECT * FROM jobs WHERE status = ? ORDER BY priority DESC, created_at ASC LIMIT ? OFFSET ?",
+                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
             )
             .bind(status.as_str())
             .bind(limit)
@@ -352,14 +352,12 @@ impl JobDb {
             .await
             .context("failed listing jobs by status")?
         } else {
-            sqlx::query(
-                "SELECT * FROM jobs ORDER BY priority DESC, created_at ASC LIMIT ? OFFSET ?",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .context("failed listing jobs")?
+            sqlx::query("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .context("failed listing jobs")?
         };
 
         rows.into_iter().map(row_to_job).collect()

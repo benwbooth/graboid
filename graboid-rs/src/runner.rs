@@ -7,12 +7,15 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 use tokio::{fs, io::AsyncWriteExt};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, warn};
 
 use crate::archives::{default_extract_dir, extract_archive, is_archive};
@@ -24,16 +27,9 @@ use crate::models::{Job, JobPhase, JobStatus};
 use crate::state::RuntimeState;
 use crate::torrent;
 
-// 1x1 PNG placeholder when we do not have a real browser frame available.
-const PLACEHOLDER_PNG: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xB5, 0x1C, 0x0C,
-    0x02, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x60, 0x60, 0x00, 0x00,
-    0x00, 0x03, 0x00, 0x01, 0x2B, 0x09, 0x4D, 0x84, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
-    0xAE, 0x42, 0x60, 0x82,
-];
-
 const MAX_BROWSE_ATTEMPTS: usize = 3;
+const MAX_BROWSE_STEPS_PER_ATTEMPT: usize = 40;
+const MAX_BROWSE_STEPS_PER_JOB: i64 = 120;
 
 #[derive(Clone)]
 pub struct JobRunner {
@@ -205,6 +201,8 @@ impl JobRunner {
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    let err_text = err.to_string();
+                    let fatal_step_budget = err_text.contains("Step budget exceeded");
                     self.log(
                         &job.id,
                         "WARNING",
@@ -215,7 +213,7 @@ impl JobRunner {
                     )
                     .await?;
 
-                    if browse_attempt < MAX_BROWSE_ATTEMPTS {
+                    if browse_attempt < MAX_BROWSE_ATTEMPTS && !fatal_step_budget {
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -525,6 +523,12 @@ impl JobRunner {
             .map(|step| step.step_number)
             .unwrap_or(0);
 
+        if step_offset >= MAX_BROWSE_STEPS_PER_JOB {
+            return Err(anyhow::anyhow!(
+                "Step budget exceeded: job already has {step_offset} steps (limit {MAX_BROWSE_STEPS_PER_JOB})"
+            ));
+        }
+
         let (nav_tx, mut nav_rx) = mpsc::unbounded_channel::<NavEvent>();
         let cfg = self.config.clone();
         let job_id_for_nav = job.id.clone();
@@ -545,6 +549,7 @@ impl JobRunner {
         });
 
         let mut emitted_steps = 0usize;
+        let mut screenshot_capture_enabled = true;
         let heartbeat = tokio::time::sleep(Duration::from_secs(12));
         tokio::pin!(heartbeat);
 
@@ -578,6 +583,21 @@ impl JobRunner {
                                 self.persist_job(job).await?;
                             }
                         }
+                        NavEvent::FoundUrl { url } => {
+                            if job.found_urls.iter().any(|existing| existing == &url) {
+                                continue;
+                            }
+
+                            job.found_urls.push(url.clone());
+                            self.log(
+                                &job.id,
+                                "INFO",
+                                "browse",
+                                &format!("Discovered URL: {url}"),
+                            )
+                            .await?;
+                            self.persist_job(job).await?;
+                        }
                         NavEvent::Step {
                             step_number,
                             action,
@@ -588,6 +608,20 @@ impl JobRunner {
                         } => {
                             emitted_steps += 1;
                             let adjusted_step = step_number + step_offset;
+
+                            if emitted_steps > MAX_BROWSE_STEPS_PER_ATTEMPT {
+                                nav_handle.abort();
+                                return Err(anyhow::anyhow!(
+                                    "Step budget exceeded: attempt produced {emitted_steps} steps (limit {MAX_BROWSE_STEPS_PER_ATTEMPT})"
+                                ));
+                            }
+                            if adjusted_step > MAX_BROWSE_STEPS_PER_JOB {
+                                nav_handle.abort();
+                                return Err(anyhow::anyhow!(
+                                    "Step budget exceeded: job reached step {adjusted_step} (limit {MAX_BROWSE_STEPS_PER_JOB})"
+                                ));
+                            }
+
                             let step = self
                                 .db
                                 .append_step(
@@ -602,32 +636,63 @@ impl JobRunner {
                                 .await?;
                             self.broadcast(ServerEvent::JobStep(step.clone()));
 
-                            let screenshot = self
-                                .db
-                                .append_screenshot(
-                                    &job.id,
-                                    PLACEHOLDER_PNG,
-                                    &url,
-                                    &format!("Step {}: {}", adjusted_step, action),
-                                    Some(adjusted_step),
+                            if screenshot_capture_enabled && !is_character_keypress_step(&action) {
+                                match capture_chrome_screenshot(
+                                    self.config.chrome_debug_port,
+                                    &self.http_client,
                                 )
-                                .await?;
-                            self.broadcast(ServerEvent::JobScreenshot(screenshot.clone()));
+                                .await
+                                {
+                                    Ok(Some((png_bytes, captured_url))) => {
+                                        let screenshot_url = if captured_url.trim().is_empty() {
+                                            url.clone()
+                                        } else {
+                                            captured_url
+                                        };
+                                        let screenshot = self
+                                            .db
+                                            .append_screenshot(
+                                                &job.id,
+                                                &png_bytes,
+                                                &screenshot_url,
+                                                &format!("Step {}: {}", adjusted_step, action),
+                                                Some(adjusted_step),
+                                            )
+                                            .await?;
+                                        self.broadcast(ServerEvent::JobScreenshot(screenshot.clone()));
 
-                            let screenshot_b64 = STANDARD.encode(&screenshot.screenshot_data);
-                            self.runtime
-                                .set_screenshot(screenshot_b64.clone(), screenshot.url.clone())
-                                .await;
-                            self.broadcast(ServerEvent::Screenshot {
-                                data_base64: screenshot_b64,
-                                url: screenshot.url,
-                            });
+                                        let screenshot_b64 = STANDARD.encode(&screenshot.screenshot_data);
+                                        self.runtime
+                                            .set_screenshot(screenshot_b64.clone(), screenshot.url.clone())
+                                            .await;
+                                        self.broadcast(ServerEvent::Screenshot {
+                                            data_base64: screenshot_b64,
+                                            url: screenshot.url,
+                                        });
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        screenshot_capture_enabled = false;
+                                        let _ = self
+                                            .log(
+                                                &job.id,
+                                                "DEBUG",
+                                                "screenshot",
+                                                &format!(
+                                                    "Live screenshot capture disabled: {err}"
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
 
                             let progress = (10.0 + (emitted_steps as f64 * 1.5)).min(40.0);
+                            let total_steps = adjusted_step.max(0);
                             let detail = if action.trim().is_empty() {
-                                format!("Browsing (step {adjusted_step})")
+                                format!("Browsing (step {total_steps})")
                             } else {
-                                format!("Browsing: {action}")
+                                format!("Browsing: {action} (step {total_steps})")
                             };
                             job.set_progress(progress, detail);
                             self.persist_job(job).await?;
@@ -642,7 +707,8 @@ impl JobRunner {
                             job.progress_message.clone()
                         }
                     } else {
-                        format!("Browsing in progress ({emitted_steps} steps)")
+                        let total_steps = step_offset + emitted_steps as i64;
+                        format!("Browsing in progress ({total_steps} steps)")
                     };
                     let progress = if emitted_steps == 0 {
                         job.progress_percent.clamp(10.0, 39.0)
@@ -668,7 +734,7 @@ impl JobRunner {
         job: &mut Job,
         navigation: &NavigationOutcome,
     ) -> Result<()> {
-        job.found_urls = navigation.found_urls.clone();
+        merge_unique_strings(&mut job.found_urls, &navigation.found_urls);
 
         if !navigation.downloaded_files.is_empty() {
             job.downloaded_files = navigation.downloaded_files.clone();
@@ -1129,6 +1195,159 @@ fn sanitize_filename(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct ChromeDebugTarget {
+    #[serde(rename = "type")]
+    target_type: Option<String>,
+    url: Option<String>,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    websocket_debugger_url: Option<String>,
+}
+
+fn is_character_keypress_step(action: &str) -> bool {
+    action.to_ascii_lowercase().contains("press_key")
+}
+
+fn choose_debug_target(targets: &[ChromeDebugTarget]) -> Option<&ChromeDebugTarget> {
+    targets
+        .iter()
+        .filter(|target| target.websocket_debugger_url.is_some())
+        .filter(|target| target.target_type.as_deref() == Some("page"))
+        .find(|target| {
+            target
+                .url
+                .as_deref()
+                .map(|url| {
+                    !url.starts_with("chrome://")
+                        && !url.starts_with("devtools://")
+                        && !url.trim().is_empty()
+                })
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            targets.iter().find(|target| {
+                target.websocket_debugger_url.is_some()
+                    && target.target_type.as_deref() == Some("page")
+            })
+        })
+}
+
+async fn capture_chrome_screenshot(
+    debug_port: u16,
+    http_client: &reqwest::Client,
+) -> Result<Option<(Vec<u8>, String)>> {
+    // Capture from a practical source viewport with decent vertical room.
+    const CAPTURE_VIEWPORT_WIDTH: i64 = 1280;
+    const CAPTURE_VIEWPORT_HEIGHT: i64 = 1024;
+
+    let list_url = format!("http://127.0.0.1:{debug_port}/json/list");
+    let targets = http_client
+        .get(&list_url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .with_context(|| format!("querying chrome targets at {list_url}"))?
+        .json::<Vec<ChromeDebugTarget>>()
+        .await
+        .context("parsing chrome target list")?;
+
+    let Some(target) = choose_debug_target(&targets) else {
+        return Ok(None);
+    };
+
+    let Some(ws_url) = target.websocket_debugger_url.as_deref() else {
+        return Ok(None);
+    };
+    let target_url = target.url.clone().unwrap_or_default();
+
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(2), connect_async(ws_url))
+        .await
+        .context("timed out connecting to chrome devtools websocket")?
+        .context("connecting to chrome devtools websocket failed")?;
+
+    ws.send(WsMessage::Text(
+        json!({"id": 1, "method": "Page.enable"}).to_string().into(),
+    ))
+    .await
+    .context("sending Page.enable failed")?;
+    ws.send(WsMessage::Text(
+        json!({
+            "id": 2,
+            "method": "Emulation.setDeviceMetricsOverride",
+            "params": {
+                "width": CAPTURE_VIEWPORT_WIDTH,
+                "height": CAPTURE_VIEWPORT_HEIGHT,
+                "deviceScaleFactor": 1,
+                "mobile": false
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .context("sending Emulation.setDeviceMetricsOverride failed")?;
+    ws.send(WsMessage::Text(
+        json!({
+            "id": 3,
+            "method": "Page.captureScreenshot",
+            "params": {
+                "format": "png",
+                "fromSurface": true
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .context("sending Page.captureScreenshot failed")?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        let maybe_msg = tokio::time::timeout(remaining, ws.next())
+            .await
+            .context("timed out waiting for screenshot response")?;
+        let Some(msg) = maybe_msg else {
+            break;
+        };
+        let msg = msg.context("reading screenshot websocket message failed")?;
+
+        if let WsMessage::Text(text) = msg {
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+
+            if value.get("id").and_then(Value::as_i64) != Some(3) {
+                continue;
+            }
+
+            if let Some(err) = value.get("error") {
+                return Err(anyhow::anyhow!("Page.captureScreenshot failed: {err}"));
+            }
+
+            let Some(data) = value
+                .get("result")
+                .and_then(|result| result.get("data"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(None);
+            };
+
+            let png_bytes = STANDARD
+                .decode(data)
+                .context("decoding captured screenshot failed")?;
+            let _ = ws.close(None).await;
+            return Ok(Some((png_bytes, target_url)));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn symlink_file(source: &Path, target: &Path) -> Result<()> {
