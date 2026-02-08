@@ -24,6 +24,13 @@
             pkgs.pkg-config
             pkgs.cmake
           ];
+          buildInputs = [
+            pkgs.openssl
+            pkgs.samba
+            pkgs.samba.dev
+            pkgs.libssh2
+            pkgs.zlib
+          ];
 
           doCheck = false;
         };
@@ -43,6 +50,7 @@
             clippy
             rust-analyzer
             pkg-config
+            pkgconf
             cmake
             watchexec
             sqlite
@@ -53,6 +61,11 @@
             nodejs_22
             chromium
             deluge
+            samba
+            samba.dev
+            openssl
+            libssh2
+            zlib
           ];
 
           RUST_LOG = "info";

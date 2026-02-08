@@ -69,12 +69,43 @@ impl BrowserBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LlmRuntime {
+    ClaudeCode,
+    CodexCli,
+}
+
+impl LlmRuntime {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::CodexCli => "Codex",
+        }
+    }
+}
+
 const CHROME_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_STARTUP_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const CLAUDE_IDLE_SILENCE_TIMEOUT: Duration = Duration::from_secs(75);
 const CLAUDE_POST_DISCOVERY_IDLE_FINISH_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAUDE_WAITING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLAUDE_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(20);
+
+fn llm_provider_key(cfg: &AppConfig) -> String {
+    let provider = cfg.llm_provider.trim();
+    if provider.is_empty() {
+        "claude_code".to_string()
+    } else {
+        provider.to_ascii_lowercase()
+    }
+}
+
+fn llm_runtime(cfg: &AppConfig) -> LlmRuntime {
+    match llm_provider_key(cfg).as_str() {
+        "claude_code" | "anthropic" => LlmRuntime::ClaudeCode,
+        _ => LlmRuntime::CodexCli,
+    }
+}
 
 pub async fn run_navigation(
     job_id: &str,
@@ -186,6 +217,7 @@ async fn run_navigation_with_backend(
     }
 
     let mcp_config = build_mcp_config(cfg, backend);
+    let runtime = llm_runtime(cfg);
 
     let full_prompt = build_prompt(
         source_url,
@@ -202,10 +234,21 @@ async fn run_navigation_with_backend(
     );
     let _ = nav_tx.send(NavEvent::Progress {
         percent: 15.0,
-        message: format!("Starting Claude with {} MCP", backend.display_name()),
+        message: format!(
+            "Starting {} with {} MCP",
+            runtime.display_name(),
+            backend.display_name()
+        ),
     });
-    let raw_output = match run_claude_session(job_id, &full_prompt, cfg, &mcp_config, &nav_tx).await
-    {
+    let run_result = match runtime {
+        LlmRuntime::ClaudeCode => {
+            run_claude_session(job_id, &full_prompt, cfg, &mcp_config, &nav_tx).await
+        }
+        LlmRuntime::CodexCli => {
+            run_codex_session(job_id, &full_prompt, cfg, backend, &nav_tx).await
+        }
+    };
+    let raw_output = match run_result {
         Ok(output) => output,
         Err(err) => {
             if let Some(child) = chrome_child.as_mut() {
@@ -234,17 +277,26 @@ async fn run_navigation_with_backend(
 }
 
 fn build_mcp_config(cfg: &AppConfig, backend: BrowserBackend) -> Value {
+    let (graboid_command, graboid_args) = graboid_tools_mcp_command(cfg);
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        "graboid-tools".to_string(),
+        json!({
+            "command": graboid_command,
+            "args": graboid_args
+        }),
+    );
+
     match backend {
         BrowserBackend::ChromeDevtools => {
             let (command, args) = chrome_devtools_mcp_command(cfg.chrome_debug_port);
-            json!({
-                "mcpServers": {
-                    "chrome-devtools": {
-                        "command": command,
-                        "args": args,
-                    }
-                }
-            })
+            servers.insert(
+                "chrome-devtools".to_string(),
+                json!({
+                    "command": command,
+                    "args": args,
+                }),
+            );
         }
         BrowserBackend::BrowserUse => {
             let command = cfg.browser_use_mcp_command.trim();
@@ -253,16 +305,19 @@ fn build_mcp_config(cfg: &AppConfig, backend: BrowserBackend) -> Value {
             if args.is_empty() {
                 args.push("browser-use[mcp]".to_string());
             }
-            json!({
-                "mcpServers": {
-                    "browser-use": {
-                        "command": command,
-                        "args": args,
-                    }
-                }
-            })
+            servers.insert(
+                "browser-use".to_string(),
+                json!({
+                    "command": command,
+                    "args": args,
+                }),
+            );
         }
     }
+
+    json!({
+        "mcpServers": servers
+    })
 }
 
 fn chrome_devtools_mcp_command(port: u16) -> (String, Vec<String>) {
@@ -285,6 +340,19 @@ fn chrome_devtools_mcp_command(port: u16) -> (String, Vec<String>) {
     )
 }
 
+fn graboid_tools_mcp_command(cfg: &AppConfig) -> (String, Vec<String>) {
+    let command = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "graboid-rs".to_string());
+    let mut args = vec!["mcp-tools".to_string()];
+    if !cfg.config_path.as_os_str().is_empty() {
+        args.push("--config".to_string());
+        args.push(cfg.config_path.display().to_string());
+    }
+    (command, args)
+}
+
 fn parse_browser_use_args(input: &str) -> Vec<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -298,6 +366,393 @@ fn parse_browser_use_args(input: &str) -> Vec<String> {
             .map(str::to_string)
             .collect()
     })
+}
+
+fn active_model<'a>(cfg: &'a AppConfig) -> &'a str {
+    let llm_model = cfg.llm_model.trim();
+    if llm_model.is_empty() {
+        cfg.claude_model.as_str()
+    } else {
+        llm_model
+    }
+}
+
+#[derive(Debug, Clone)]
+struct McpServerSpec {
+    name: String,
+    command: String,
+    args: Vec<String>,
+}
+
+fn mcp_server_specs(cfg: &AppConfig, backend: BrowserBackend) -> Vec<McpServerSpec> {
+    let mut specs = Vec::new();
+    let (graboid_command, graboid_args) = graboid_tools_mcp_command(cfg);
+    specs.push(McpServerSpec {
+        name: "graboid_tools".to_string(),
+        command: graboid_command,
+        args: graboid_args,
+    });
+
+    match backend {
+        BrowserBackend::ChromeDevtools => {
+            let (command, args) = chrome_devtools_mcp_command(cfg.chrome_debug_port);
+            specs.push(McpServerSpec {
+                name: "chrome_devtools".to_string(),
+                command,
+                args,
+            });
+        }
+        BrowserBackend::BrowserUse => {
+            let command = cfg.browser_use_mcp_command.trim();
+            let command = if command.is_empty() { "uvx" } else { command };
+            let mut args = parse_browser_use_args(&cfg.browser_use_mcp_args);
+            if args.is_empty() {
+                args.push("browser-use[mcp]".to_string());
+            }
+            specs.push(McpServerSpec {
+                name: "browser_use".to_string(),
+                command: command.to_string(),
+                args,
+            });
+        }
+    }
+    specs
+}
+
+fn toml_quote(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn toml_array(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| toml_quote(value))
+        .collect::<Vec<_>>();
+    format!("[{}]", items.join(", "))
+}
+
+fn configure_codex_provider(cmd: &mut Command, cfg: &AppConfig, provider: &str) -> Result<()> {
+    match provider {
+        "openai" => {
+            if std::env::var("OPENAI_API_KEY").is_err() {
+                return Err(anyhow!(
+                    "OPENAI_API_KEY is required for llm_provider=openai"
+                ));
+            }
+        }
+        "openrouter" => {
+            let key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
+                anyhow!("OPENROUTER_API_KEY is required for llm_provider=openrouter")
+            })?;
+            cmd.env("OPENAI_API_KEY", key)
+                .env("OPENAI_BASE_URL", "https://openrouter.ai/api/v1");
+        }
+        "google" => {
+            let key = std::env::var("GOOGLE_API_KEY")
+                .map_err(|_| anyhow!("GOOGLE_API_KEY is required for llm_provider=google"))?;
+            cmd.env("OPENAI_API_KEY", key).env(
+                "OPENAI_BASE_URL",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            );
+        }
+        "ollama" => {
+            cmd.arg("--oss").arg("--local-provider").arg("ollama");
+            if !cfg.ollama_host.trim().is_empty() {
+                cmd.env("OLLAMA_BASE_URL", cfg.ollama_host.trim());
+            }
+        }
+        "claude_code" | "anthropic" => {}
+        other => {
+            return Err(anyhow!(
+                "unsupported llm_provider `{other}` for codex backend"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn extract_mcp_call_text(item: &Value) -> Option<String> {
+    let result = item.get("result")?;
+    let mut lines = Vec::new();
+    if let Some(content) = result.get("content").and_then(Value::as_array) {
+        for block in content {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    if let Some(structured) = result
+        .get("structured_content")
+        .or_else(|| result.get("structuredContent"))
+    {
+        let rendered = structured.to_string();
+        if !rendered.is_empty() && rendered != "null" {
+            lines.push(rendered);
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn handle_codex_line(
+    line: &str,
+    raw_output: &mut String,
+    step_counter: &mut i64,
+    nav_tx: &mpsc::UnboundedSender<NavEvent>,
+) -> usize {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let mut found_urls = 0usize;
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if value.get("type").and_then(Value::as_str) == Some("item.completed")
+            && let Some(item) = value.get("item")
+        {
+            match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "agent_message" => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        let links = parse_download_links(text);
+                        found_urls += links.len();
+                        for url in links {
+                            let _ = nav_tx.send(NavEvent::FoundUrl { url });
+                        }
+                        raw_output.push_str(text);
+                        raw_output.push('\n');
+                        for output_line in text.lines().map(str::trim).filter(|v| !v.is_empty()) {
+                            let _ = nav_tx.send(NavEvent::Log {
+                                level: "INFO".to_string(),
+                                source: "agent_output".to_string(),
+                                message: output_line.to_string(),
+                            });
+                        }
+                    }
+                }
+                "mcp_tool_call" => {
+                    *step_counter += 1;
+                    let server = item
+                        .get("server")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                    let arguments = item.get("arguments").cloned().unwrap_or(Value::Null);
+                    let status = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let is_error = status.eq_ignore_ascii_case("failed")
+                        || item.get("error").map(|v| !v.is_null()).unwrap_or(false);
+
+                    let tool_name = if server.is_empty() {
+                        tool.to_string()
+                    } else {
+                        format!("{server}.{tool}")
+                    };
+                    let (action, mut observation, url) = map_tool_to_step(&tool_name, &arguments);
+                    if let Some(error_message) = item
+                        .get("error")
+                        .and_then(|v| v.get("message"))
+                        .and_then(Value::as_str)
+                    {
+                        observation =
+                            format!("{observation} | error: {}", truncate(error_message, 180));
+                    }
+                    let _ = nav_tx.send(NavEvent::Step {
+                        step_number: *step_counter,
+                        action,
+                        observation,
+                        url,
+                        is_error,
+                        notes: Vec::new(),
+                    });
+
+                    if let Some(text) = extract_mcp_call_text(item) {
+                        let links = parse_download_links(&text);
+                        found_urls += links.len();
+                        for url in links {
+                            let _ = nav_tx.send(NavEvent::FoundUrl { url });
+                        }
+                        raw_output.push_str(&text);
+                        raw_output.push('\n');
+                    }
+                }
+                "command_execution" => {
+                    let command = item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let status = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let is_error = status.eq_ignore_ascii_case("failed")
+                        || item
+                            .get("exit_code")
+                            .and_then(Value::as_i64)
+                            .map(|code| code != 0)
+                            .unwrap_or(false);
+                    *step_counter += 1;
+                    let _ = nav_tx.send(NavEvent::Step {
+                        step_number: *step_counter,
+                        action: "Command".to_string(),
+                        observation: format!(
+                            "Codex executed shell command (status={status}): {}",
+                            truncate(command, 180)
+                        ),
+                        url: String::new(),
+                        is_error,
+                        notes: Vec::new(),
+                    });
+                    if let Some(output) = item.get("aggregated_output").and_then(Value::as_str) {
+                        let output = output.trim();
+                        if !output.is_empty() {
+                            raw_output.push_str(output);
+                            raw_output.push('\n');
+                            let links = parse_download_links(output);
+                            found_urls += links.len();
+                            for url in links {
+                                let _ = nav_tx.send(NavEvent::FoundUrl { url });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return found_urls;
+    }
+
+    raw_output.push_str(trimmed);
+    raw_output.push('\n');
+    0
+}
+
+async fn run_codex_session(
+    job_id: &str,
+    prompt: &str,
+    cfg: &AppConfig,
+    backend: BrowserBackend,
+    nav_tx: &mpsc::UnboundedSender<NavEvent>,
+) -> Result<String> {
+    let _ = nav_tx.send(NavEvent::Progress {
+        percent: 15.5,
+        message: "Spawning Codex process".to_string(),
+    });
+
+    let provider = llm_provider_key(cfg);
+    let mut cmd = Command::new("codex");
+    cmd.arg("exec")
+        .arg("--json")
+        .arg("--disable")
+        .arg("shell_tool")
+        .arg("-m")
+        .arg(active_model(cfg))
+        .arg(prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    configure_codex_provider(&mut cmd, cfg, &provider)?;
+
+    for spec in mcp_server_specs(cfg, backend) {
+        let key = spec.name.replace('-', "_");
+        cmd.arg("-c").arg(format!(
+            "mcp_servers.{key}.command={}",
+            toml_quote(&spec.command)
+        ));
+        cmd.arg("-c")
+            .arg(format!("mcp_servers.{key}.args={}", toml_array(&spec.args)));
+    }
+
+    let mut proc = cmd
+        .spawn()
+        .with_context(|| "failed to spawn codex".to_string())?;
+
+    let _ = nav_tx.send(NavEvent::Progress {
+        percent: 17.0,
+        message: "Waiting for Codex startup".to_string(),
+    });
+
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    if let Some(stdout) = proc.stdout.take() {
+        spawn_output_reader(stdout, line_tx.clone(), "codex-stdout");
+    }
+    if let Some(stderr) = proc.stderr.take() {
+        spawn_output_reader(stderr, line_tx.clone(), "codex-stderr");
+    }
+    drop(line_tx);
+
+    let mut raw_output = String::new();
+    let mut step_counter = 0_i64;
+    let mut discovered_url_count = 0usize;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(cfg.claude_timeout_seconds));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                warn!(job_id, "codex timed out after {}s", cfg.claude_timeout_seconds);
+                let _ = nav_tx.send(NavEvent::Log {
+                    level: "ERROR".to_string(),
+                    source: "agent".to_string(),
+                    message: format!("Codex timed out after {} seconds", cfg.claude_timeout_seconds),
+                });
+                let _ = proc.kill().await;
+                return Err(anyhow!("codex timed out after {} seconds", cfg.claude_timeout_seconds));
+            }
+            maybe_line = line_rx.recv() => {
+                match maybe_line {
+                    Some(line) => {
+                        discovered_url_count +=
+                            handle_codex_line(&line, &mut raw_output, &mut step_counter, nav_tx);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(5), proc.wait()).await;
+    match status {
+        Ok(Ok(exit)) if exit.success() => {
+            info!(job_id, "codex exited successfully");
+        }
+        Ok(Ok(exit)) => {
+            let message = format!("Codex exited with status {exit}");
+            let _ = nav_tx.send(NavEvent::Log {
+                level: "ERROR".to_string(),
+                source: "agent".to_string(),
+                message: message.clone(),
+            });
+            return Err(anyhow!(message));
+        }
+        Ok(Err(err)) => {
+            return Err(err).context("waiting for codex failed");
+        }
+        Err(_) => {
+            let _ = proc.kill().await;
+            return Err(anyhow!("timed out waiting for codex process to exit"));
+        }
+    }
+
+    if discovered_url_count > 0 {
+        let _ = nav_tx.send(NavEvent::Log {
+            level: "INFO".to_string(),
+            source: "browse".to_string(),
+            message: format!("Codex discovered {discovered_url_count} download candidate URL(s)"),
+        });
+    }
+
+    Ok(raw_output)
 }
 
 async fn run_claude_session(
@@ -316,7 +771,7 @@ async fn run_claude_session(
     cmd.arg("-p")
         .arg(prompt)
         .arg("--model")
-        .arg(&cfg.claude_model)
+        .arg(active_model(cfg))
         .arg("--mcp-config")
         .arg(mcp_config.to_string())
         .arg("--strict-mcp-config")
@@ -380,7 +835,7 @@ async fn run_claude_session(
                 warn!(job_id, "claude timed out after {}s", cfg.claude_timeout_seconds);
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "ERROR".to_string(),
-                    source: "claude".to_string(),
+                    source: "agent".to_string(),
                     message: format!("Claude timed out after {} seconds", cfg.claude_timeout_seconds),
                 });
                 let _ = proc.kill().await;
@@ -390,7 +845,7 @@ async fn run_claude_session(
                 startup_waited += CLAUDE_WAITING_LOG_INTERVAL.as_secs();
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "INFO".to_string(),
-                    source: "claude".to_string(),
+                    source: "agent".to_string(),
                     message: format!(
                         "Still waiting for Claude MCP startup ({}s elapsed)",
                         startup_waited
@@ -413,7 +868,7 @@ async fn run_claude_session(
                 {
                     let _ = nav_tx.send(NavEvent::Log {
                         level: "INFO".to_string(),
-                        source: "claude".to_string(),
+                        source: "agent".to_string(),
                         message: format!(
                             "No new Claude output for {idle_secs}s after finding {discovered_url_count} URL(s); ending browse attempt"
                         ),
@@ -425,7 +880,7 @@ async fn run_claude_session(
 
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "INFO".to_string(),
-                    source: "claude".to_string(),
+                    source: "agent".to_string(),
                     message: format!("Waiting for Claude output ({idle_secs}s idle)"),
                 });
             }
@@ -445,7 +900,7 @@ async fn run_claude_session(
                 warn!(job_id, "{message}");
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "ERROR".to_string(),
-                    source: "claude".to_string(),
+                    source: "agent".to_string(),
                     message: message.clone(),
                 });
                 let _ = nav_tx.send(NavEvent::Progress {
@@ -495,7 +950,7 @@ async fn run_claude_session(
         Ok(Ok(exit)) => {
             let _ = nav_tx.send(NavEvent::Log {
                 level: "ERROR".to_string(),
-                source: "claude".to_string(),
+                source: "agent".to_string(),
                 message: format!("Claude exited with status {}", exit),
             });
             return Err(anyhow!("claude exited unsuccessfully: {exit}"));
@@ -534,7 +989,7 @@ fn handle_claude_line(
                 result.stream_connected = true;
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "INFO".to_string(),
-                    source: "claude".to_string(),
+                    source: "agent".to_string(),
                     message: "Claude stream connected".to_string(),
                 });
             }
@@ -581,11 +1036,10 @@ fn handle_claude_line(
                                         if line.is_empty() {
                                             continue;
                                         }
-                                        let excerpt = truncate(line, 220);
                                         let _ = nav_tx.send(NavEvent::Log {
                                             level: "INFO".to_string(),
-                                            source: "claude_output".to_string(),
-                                            message: excerpt,
+                                            source: "agent_output".to_string(),
+                                            message: line.to_string(),
                                         });
                                     }
                                 }
@@ -617,7 +1071,7 @@ fn handle_claude_line(
     raw_output.push('\n');
     let _ = nav_tx.send(NavEvent::Log {
         level: "DEBUG".to_string(),
-        source: "claude_raw".to_string(),
+        source: "agent_raw".to_string(),
         message: truncate(trimmed, 220),
     });
     ClaudeLineResult::default()
@@ -663,6 +1117,70 @@ where
 fn map_tool_to_step(tool_name: &str, input: &Value) -> (String, String, String) {
     let name = tool_name.to_ascii_lowercase();
     let input_text = truncate(&input.to_string(), 200);
+
+    if name.contains("torznab_search") {
+        return (
+            "Torznab Search".to_string(),
+            format!("Search Torznab API ({input_text})"),
+            String::new(),
+        );
+    }
+
+    if name.contains("torrent_add") {
+        return (
+            "Torrent Add".to_string(),
+            format!("Add torrent via API ({input_text})"),
+            String::new(),
+        );
+    }
+
+    if name.contains("torrent_selective_fetch") {
+        return (
+            "Torrent Selective Fetch".to_string(),
+            format!("Selective torrent fetch via API ({input_text})"),
+            String::new(),
+        );
+    }
+
+    if name.contains("torrent_client_info") {
+        return (
+            "Torrent Client Info".to_string(),
+            "Load torrent client configuration".to_string(),
+            String::new(),
+        );
+    }
+
+    if name.contains("source_catalog") {
+        return (
+            "Source Catalog".to_string(),
+            "Load local/remote source catalog".to_string(),
+            String::new(),
+        );
+    }
+
+    if name.contains("source_list_dir") {
+        return (
+            "Source List Dir".to_string(),
+            format!("List source directory ({input_text})"),
+            String::new(),
+        );
+    }
+
+    if name.contains("source_read_text") {
+        return (
+            "Source Read Text".to_string(),
+            format!("Read source text file ({input_text})"),
+            String::new(),
+        );
+    }
+
+    if name.contains("source_copy_to_downloads") {
+        return (
+            "Source Copy".to_string(),
+            format!("Copy source file to downloads ({input_text})"),
+            String::new(),
+        );
+    }
 
     if name.contains("navigate") {
         let url = input
@@ -807,6 +1325,17 @@ fn build_prompt(
         BrowserBackend::BrowserUse => "Use browser-use MCP tools for navigation.",
     };
     let named_source_catalog = render_named_source_catalog(&cfg.named_sources());
+    let local_filesystem_policy =
+        render_local_filesystem_policy(&cfg.local_read_whitelist, &cfg.local_write_whitelist);
+    let graboid_tooling_block = "GRABOID MCP TOOLS:\n\
+         - `torznab_search(query, fresh?, max_results?)`: Search configured Torznab endpoint.\n\
+         - `torrent_add(source, client?)`: Queue a torrent/magnet through configured client APIs.\n\
+         - `torrent_selective_fetch(source, prompt, file_filter[])`: Selective embedded torrent fetch when available.\n\
+         - `source_catalog()`: List named remote sources and local allowlists.\n\
+         - `source_list_dir(source_name?, path)`: List directory entries from local or named source.\n\
+         - `source_read_text(source_name?, path, max_bytes?)`: Read source text content.\n\
+         - `source_copy_to_downloads(source_name?, path, destination_subpath?)`: Copy source file into downloads.\n\
+         - `torrent_client_info()`: Inspect active torrent/Torznab runtime config.\n\n";
     let file_filter_summary = if file_filter.is_empty() {
         "none".to_string()
     } else {
@@ -850,6 +1379,8 @@ fn build_prompt(
          - selective_torrent: {}\n\
          - archive_extractors: zip, 7z, rar, tar, tar.gz, tar.bz2, tar.xz, tar.zst/tzst, gz, bz2, xz, zst\n\n\
          {}\
+         {}\
+         {}\
          BACKEND TOOLCHAIN (triggered by your outputs):\n\
          - Emit `[DOWNLOAD] URL: <url>` for direct files, magnet links, or `.torrent` links.\n\
          - Backend will download, extract archives, filter files, and place final outputs automatically.\n\
@@ -857,6 +1388,13 @@ fn build_prompt(
          - After surveying relevant options on the current page, emit a curated set of best candidates (usually 1-5).\n\n\
          REQUIREMENTS:\n\
          - {} \n\
+         - Prioritize explicit user constraints over historical patterns or defaults.\n\
+         - Always follow the user's directions and respect their wishes.\n\
+         - Preserve the user's requested approach and constraints; do not switch methods unless blocked and fallback is explicitly justified.\n\
+         - If candidate links are provided in context, treat them as options to evaluate, not automatic selections.\n\
+         - Emit `[DOWNLOAD]` only for links that clearly match the requested target; if relevance is unclear, gather more evidence before selecting.\n\
+         - For torrent/indexer tasks, use Graboid MCP tools (`torznab_search`, `torrent_add`) instead of browsing Torznab/Jackett web UI.\n\
+         - For local/SFTP/FTP/Samba source tasks, use Graboid MCP source tools (`source_catalog`, `source_list_dir`, `source_read_text`, `source_copy_to_downloads`) rather than website UI navigation.\n\
          - Use targeted page search with evaluate_script (querySelectorAll on links/buttons) before broad snapshots.\n\
          - On long directory pages, do one evaluate_script pass that extracts all anchor href/text pairs and filter in-script by task keywords.\n\
          - Do not loop between homepage and the same directory. Stay in the deepest relevant page until links are extracted.\n\
@@ -868,6 +1406,7 @@ fn build_prompt(
          - Avoid low-value or ambiguous variants unless no better candidate exists.\n\
          - Do not stop at the first plausible link; quickly compare nearby alternatives on the same page before deciding.\n\
          - If you use a configured named source, emit `[SOURCE] NAME: <name>` once when selecting it.\n\
+         - If local filesystem access is needed, stay strictly within the listed allowlisted paths.\n\
          - Emit learning notes when useful: [LEARNING: type=navigation_tip] <tip> or [LEARNING: type=download_method] <tip>\n\
          - Emit clear progress while navigating.\n\
          - End with [RESULT] SUCCESS: true/false\n\
@@ -884,6 +1423,8 @@ fn build_prompt(
         cfg.torrent_client,
         selective_torrent_status,
         named_source_catalog,
+        local_filesystem_policy,
+        graboid_tooling_block,
         backend_requirement,
         file_filter_requirement,
         target
@@ -927,6 +1468,59 @@ fn render_named_source_catalog(named_sources: &[NamedSource]) -> String {
         "NAMED REMOTE SOURCES (prefer these before broad web search when relevant):\n{}\n\n",
         lines.join("\n")
     )
+}
+
+fn render_local_filesystem_policy(read_allowlist: &[String], write_allowlist: &[String]) -> String {
+    let read_paths = normalize_allowlist_paths(read_allowlist);
+    let write_paths = normalize_allowlist_paths(write_allowlist);
+
+    let read_block = if read_paths.is_empty() {
+        "- none configured".to_string()
+    } else {
+        read_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let write_block = if write_paths.is_empty() {
+        "- none configured".to_string()
+    } else {
+        write_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "LOCAL FILESYSTEM ACCESS POLICY (read/write allowlists):\n\
+         Read allowlist:\n{}\n\
+         Write allowlist:\n{}\n\
+         Guidance:\n\
+         - Treat these as hard boundaries for local filesystem choices.\n\
+         - If the needed path is outside allowlists, report the constraint instead of guessing.\n\n",
+        read_block, write_block
+    )
+}
+
+fn normalize_allowlist_paths(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for value in values {
+        let path = value.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if seen.insert(path.to_string()) {
+            normalized.push(path.to_string());
+        }
+        if normalized.len() >= 32 {
+            break;
+        }
+    }
+    normalized
 }
 
 async fn start_chrome(job_id: &str, cfg: &AppConfig, download_dir: &Path) -> Result<Child> {

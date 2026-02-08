@@ -1,10 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+#[cfg(feature = "librqbit-embedded")]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "librqbit-embedded")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "librqbit-embedded")]
-use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(feature = "librqbit-embedded")]
@@ -15,6 +16,16 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 use crate::config::AppConfig;
+
+#[derive(Debug, Clone)]
+pub struct TorznabSearchResult {
+    pub title: String,
+    pub download_url: String,
+    pub details_url: Option<String>,
+    pub seeders: Option<i64>,
+    pub size_bytes: Option<u64>,
+    pub indexer: Option<String>,
+}
 
 pub async fn add_torrent(cfg: &AppConfig, source: &str) -> Result<String> {
     match cfg.torrent_client.as_str() {
@@ -27,6 +38,100 @@ pub async fn add_torrent(cfg: &AppConfig, source: &str) -> Result<String> {
         "aria2" => add_aria2(cfg, source).await,
         unsupported => bail!("unsupported torrent client: {unsupported}"),
     }
+}
+
+pub async fn search_torznab(cfg: &AppConfig, query: &str) -> Result<Vec<TorznabSearchResult>> {
+    search_torznab_internal(cfg, query, None, None).await
+}
+
+pub async fn search_torznab_fresh(
+    cfg: &AppConfig,
+    query: &str,
+) -> Result<Vec<TorznabSearchResult>> {
+    // Force Jackett/Prowlarr to hit upstream indexers instead of serving cached results.
+    search_torznab_internal(cfg, query, Some(false), Some(75)).await
+}
+
+async fn search_torznab_internal(
+    cfg: &AppConfig,
+    query: &str,
+    cache: Option<bool>,
+    timeout_override_secs: Option<u64>,
+) -> Result<Vec<TorznabSearchResult>> {
+    if !cfg.torznab_enabled {
+        return Ok(Vec::new());
+    }
+
+    let endpoint = cfg.torznab_endpoint.trim();
+    if endpoint.is_empty() {
+        bail!("torznab_enabled is true but torznab_endpoint is empty");
+    }
+
+    let normalized_query = build_torznab_query(query);
+    if normalized_query.is_empty() {
+        bail!("torznab query is empty");
+    }
+
+    let max_results = cfg.torznab_max_results.max(1).min(200);
+    let timeout_secs = timeout_override_secs
+        .unwrap_or(cfg.download_timeout_seconds)
+        .clamp(10, 120);
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(cfg.download_allow_insecure)
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context("failed creating Torznab HTTP client")?;
+
+    let mut request = client
+        .get(endpoint)
+        .query(&[("t", "search"), ("q", normalized_query.as_str())])
+        .query(&[("limit", max_results.to_string())]);
+
+    if !cfg.torznab_api_key.trim().is_empty() {
+        request = request.query(&[("apikey", cfg.torznab_api_key.trim())]);
+    }
+    if !cfg.torznab_categories.trim().is_empty() {
+        request = request.query(&[("cat", cfg.torznab_categories.trim())]);
+    }
+    if let Some(cache_enabled) = cache {
+        request = request.query(&[("cache", if cache_enabled { "true" } else { "false" })]);
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("torznab search request failed for endpoint {endpoint}"))?;
+    if !response.status().is_success() {
+        bail!("torznab search failed with HTTP {}", response.status());
+    }
+
+    let body = response
+        .text()
+        .await
+        .context("failed reading Torznab response body")?;
+    if let Some(feed_error) = parse_torznab_error(&body) {
+        bail!("torznab feed error: {feed_error}");
+    }
+    let mut results = parse_torznab_feed(&body);
+    results.retain(|item| is_torznab_download_url(&item.download_url));
+    if results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    rank_torznab_results(&mut results, &normalized_query);
+
+    let mut deduped = Vec::new();
+    let mut seen_urls = HashSet::new();
+    for item in results {
+        if seen_urls.insert(item.download_url.clone()) {
+            deduped.push(item);
+        }
+        if deduped.len() >= max_results {
+            break;
+        }
+    }
+
+    Ok(deduped)
 }
 
 pub async fn selective_fetch_from_torrent(
@@ -835,6 +940,256 @@ fn is_archive_filename(filename_lower: &str) -> bool {
     .any(|suffix| filename_lower.ends_with(suffix))
 }
 
+fn parse_torznab_feed(xml: &str) -> Vec<TorznabSearchResult> {
+    let Ok(item_re) = Regex::new(r"(?is)<item\b[^>]*>(.*?)</item>") else {
+        return Vec::new();
+    };
+    let Ok(title_re) = Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>") else {
+        return Vec::new();
+    };
+    let Ok(link_re) = Regex::new(r"(?is)<link\b[^>]*>(.*?)</link>") else {
+        return Vec::new();
+    };
+    let Ok(guid_re) = Regex::new(r"(?is)<guid\b[^>]*>(.*?)</guid>") else {
+        return Vec::new();
+    };
+    let Ok(enclosure_url_re) =
+        Regex::new(r#"(?is)<enclosure\b[^>]*\burl\s*=\s*["']([^"']+)["'][^>]*>"#)
+    else {
+        return Vec::new();
+    };
+    let Ok(enclosure_len_re) =
+        Regex::new(r#"(?is)<enclosure\b[^>]*\blength\s*=\s*["']([^"']+)["'][^>]*>"#)
+    else {
+        return Vec::new();
+    };
+    let Ok(attr_re) = Regex::new(
+        r#"(?is)<torznab:attr\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*\bvalue\s*=\s*["']([^"']*)["'][^>]*>"#,
+    ) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    for captures in item_re.captures_iter(xml) {
+        let Some(item_raw) = captures.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+
+        let title = title_re
+            .captures(item_raw)
+            .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "untitled".to_string());
+
+        let details_url = guid_re
+            .captures(item_raw)
+            .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                link_re
+                    .captures(item_raw)
+                    .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+
+        let download_url = enclosure_url_re
+            .captures(item_raw)
+            .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                link_re
+                    .captures(item_raw)
+                    .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .or_else(|| {
+                guid_re
+                    .captures(item_raw)
+                    .and_then(|m| m.get(1).map(|v| decode_xml_text(v.as_str())))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+
+        let Some(download_url) = download_url else {
+            continue;
+        };
+
+        let mut attrs = HashMap::<String, String>::new();
+        for attr_caps in attr_re.captures_iter(item_raw) {
+            let Some(name) = attr_caps.get(1).map(|m| m.as_str()) else {
+                continue;
+            };
+            let Some(value) = attr_caps.get(2).map(|m| m.as_str()) else {
+                continue;
+            };
+            attrs.insert(
+                name.trim().to_ascii_lowercase(),
+                decode_xml_text(value).trim().to_string(),
+            );
+        }
+
+        let seeders = attrs
+            .get("seeders")
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| {
+                attrs
+                    .get("peers")
+                    .and_then(|value| value.parse::<i64>().ok())
+            });
+        let indexer = attrs
+            .get("indexer")
+            .or_else(|| attrs.get("jackettindexer"))
+            .cloned()
+            .filter(|value| !value.trim().is_empty());
+        let size_bytes = attrs
+            .get("size")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| {
+                enclosure_len_re
+                    .captures(item_raw)
+                    .and_then(|m| m.get(1).map(|v| v.as_str().trim().to_string()))
+                    .and_then(|value| value.parse::<u64>().ok())
+            });
+
+        items.push(TorznabSearchResult {
+            title,
+            download_url,
+            details_url,
+            seeders,
+            size_bytes,
+            indexer,
+        });
+    }
+
+    items
+}
+
+fn parse_torznab_error(xml: &str) -> Option<String> {
+    let Ok(error_re) = Regex::new(
+        r#"(?is)<error\b[^>]*\bcode\s*=\s*["']([^"']*)["'][^>]*\bdescription\s*=\s*["']([^"']*)["'][^>]*/?>"#,
+    ) else {
+        return None;
+    };
+    let Some(captures) = error_re.captures(xml) else {
+        return None;
+    };
+    let code = captures
+        .get(1)
+        .map(|m| decode_xml_text(m.as_str()))
+        .unwrap_or_default();
+    let description = captures
+        .get(2)
+        .map(|m| decode_xml_text(m.as_str()))
+        .unwrap_or_else(|| "Unknown Torznab error".to_string());
+    let code = code.trim();
+    if code.is_empty() {
+        Some(description.trim().to_string())
+    } else {
+        Some(format!("code {code}: {}", description.trim()))
+    }
+}
+
+fn decode_xml_text(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    if text.starts_with("<![CDATA[") && text.ends_with("]]>") && text.len() >= 12 {
+        text = text[9..text.len() - 3].to_string();
+    }
+    text.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn build_torznab_query(prompt: &str) -> String {
+    let stop_words = HashSet::from([
+        "a", "an", "and", "archive", "as", "at", "by", "download", "file", "files", "for", "from",
+        "get", "in", "is", "it", "my", "of", "on", "or", "site", "the", "to", "with",
+    ]);
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+
+    for token in prompt
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+    {
+        let trimmed = token.trim();
+        if trimmed.len() < 2 || stop_words.contains(trimmed) {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            tokens.push(trimmed.to_string());
+        }
+        if tokens.len() >= 12 {
+            break;
+        }
+    }
+
+    if tokens.is_empty() {
+        prompt.trim().to_string()
+    } else {
+        tokens.join(" ")
+    }
+}
+
+fn torznab_query_keywords(query: &str) -> Vec<String> {
+    query
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|value| value.len() >= 2)
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn torznab_score(item: &TorznabSearchResult, keywords: &[String]) -> i64 {
+    let title = item.title.to_ascii_lowercase();
+    let mut score = 0_i64;
+    for keyword in keywords {
+        if title.contains(keyword) {
+            score += 10;
+        }
+    }
+
+    if title.contains("sample") || title.contains("trailer") || title.contains("cam") {
+        score -= 18;
+    }
+    if item.download_url.starts_with("magnet:") {
+        score += 8;
+    }
+    if let Some(seeders) = item.seeders {
+        score += seeders.clamp(0, 600) / 6;
+    }
+    if let Some(size) = item.size_bytes {
+        let size_boost = (size / (100 * 1024 * 1024)) as i64;
+        score += size_boost.clamp(0, 24);
+    }
+
+    score
+}
+
+fn rank_torznab_results(results: &mut [TorznabSearchResult], query: &str) {
+    let keywords = torznab_query_keywords(query);
+    results.sort_by(|left, right| {
+        let right_score = torznab_score(right, &keywords);
+        let left_score = torznab_score(left, &keywords);
+        right_score
+            .cmp(&left_score)
+            .then_with(|| right.seeders.unwrap_or(0).cmp(&left.seeders.unwrap_or(0)))
+            .then_with(|| left.title.len().cmp(&right.title.len()))
+    });
+}
+
+fn is_torznab_download_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("magnet:") || lower.starts_with("http://") || lower.starts_with("https://")
+}
+
 fn extract_magnet_hash(source: &str) -> Option<String> {
     if !source.starts_with("magnet:") {
         return None;
@@ -917,4 +1272,83 @@ fn has_explicit_port(base: &str) -> bool {
         .rsplit_once(':')
         .and_then(|(_, maybe_port)| maybe_port.parse::<u16>().ok())
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_torznab_query, parse_torznab_error, parse_torznab_feed, rank_torznab_results,
+    };
+
+    #[test]
+    fn torznab_query_removes_common_noise_tokens() {
+        let query = build_torznab_query("download the tmnt arcade nes rom from a torrent site");
+        assert!(query.contains("tmnt"));
+        assert!(query.contains("arcade"));
+        assert!(query.contains("nes"));
+        assert!(!query.contains("download"));
+        assert!(!query.contains("site"));
+    }
+
+    #[test]
+    fn torznab_feed_parser_extracts_core_fields() {
+        let xml = r#"<?xml version="1.0"?>
+<rss>
+  <channel>
+    <item>
+      <title><![CDATA[TMNT Arcade Game (USA)]]></title>
+      <guid>https://example.test/details/123</guid>
+      <link>magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef01</link>
+      <torznab:attr name="seeders" value="57" />
+      <torznab:attr name="indexer" value="DemoIndexer" />
+      <torznab:attr name="size" value="123456789" />
+    </item>
+  </channel>
+</rss>"#;
+
+        let mut items = parse_torznab_feed(xml);
+        assert_eq!(items.len(), 1);
+        let item = items.remove(0);
+        assert_eq!(item.title, "TMNT Arcade Game (USA)");
+        assert!(item.download_url.starts_with("magnet:?xt=urn:btih:"));
+        assert_eq!(item.seeders, Some(57));
+        assert_eq!(item.indexer.as_deref(), Some("DemoIndexer"));
+        assert_eq!(item.size_bytes, Some(123456789));
+        assert_eq!(
+            item.details_url.as_deref(),
+            Some("https://example.test/details/123")
+        );
+    }
+
+    #[test]
+    fn torznab_ranking_prefers_seeded_keyword_matches() {
+        let xml = r#"<?xml version="1.0"?>
+<rss>
+  <channel>
+    <item>
+      <title>TMNT Arcade Good Release</title>
+      <link>magnet:?xt=urn:btih:1111111111111111111111111111111111111111</link>
+      <torznab:attr name="seeders" value="45" />
+    </item>
+    <item>
+      <title>Unrelated title sample</title>
+      <link>magnet:?xt=urn:btih:2222222222222222222222222222222222222222</link>
+      <torznab:attr name="seeders" value="2" />
+    </item>
+  </channel>
+</rss>"#;
+
+        let mut items = parse_torznab_feed(xml);
+        rank_torznab_results(&mut items, "tmnt arcade");
+        assert_eq!(items[0].title, "TMNT Arcade Good Release");
+    }
+
+    #[test]
+    fn torznab_error_parser_extracts_code_and_description() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<error code="100" description="Invalid API Key" />"#;
+
+        let error = parse_torznab_error(xml);
+        assert_eq!(error.as_deref(), Some("code 100: Invalid API Key"));
+    }
 }

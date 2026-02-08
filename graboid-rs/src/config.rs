@@ -20,6 +20,8 @@ struct FileConfig {
     download_allow_insecure: Option<bool>,
     jobs_max_concurrent: Option<usize>,
     claude_model: Option<String>,
+    llm_provider: Option<String>,
+    llm_model: Option<String>,
     claude_cmd: Option<String>,
     api_key: Option<String>,
     chrome_debug_port: Option<u16>,
@@ -48,6 +50,11 @@ struct FileConfig {
     aria2_host: Option<String>,
     aria2_port: Option<u16>,
     aria2_secret: Option<String>,
+    torznab_enabled: Option<bool>,
+    torznab_endpoint: Option<String>,
+    torznab_api_key: Option<String>,
+    torznab_categories: Option<String>,
+    torznab_max_results: Option<usize>,
     source_mode: Option<String>,
     source_endpoints: Option<Vec<String>>,
     source_sftp_host: Option<String>,
@@ -310,6 +317,31 @@ const CONFIG_FIELD_SPECS: &[ConfigFieldSpec] = &[
         form_mode: FormFieldMode::Text,
     },
     ConfigFieldSpec {
+        key: "torznab_enabled",
+        value: ConfigFieldValue::Bool(false),
+        form_mode: FormFieldMode::Checkbox,
+    },
+    ConfigFieldSpec {
+        key: "torznab_endpoint",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "torznab_api_key",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "torznab_categories",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "torznab_max_results",
+        value: ConfigFieldValue::Integer(30),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
         key: "source_mode",
         value: ConfigFieldValue::String("web"),
         form_mode: FormFieldMode::Text,
@@ -412,6 +444,8 @@ pub struct AppConfig {
     pub download_allow_insecure: bool,
     pub jobs_max_concurrent: usize,
     pub claude_model: String,
+    pub llm_provider: String,
+    pub llm_model: String,
     pub claude_cmd: String,
     pub api_key: String,
     pub chrome_debug_port: u16,
@@ -443,6 +477,11 @@ pub struct AppConfig {
     pub aria2_host: String,
     pub aria2_port: u16,
     pub aria2_secret: String,
+    pub torznab_enabled: bool,
+    pub torznab_endpoint: String,
+    pub torznab_api_key: String,
+    pub torznab_categories: String,
+    pub torznab_max_results: usize,
     pub source_mode: String,
     pub source_endpoints: Vec<String>,
     pub source_sftp_host: String,
@@ -477,6 +516,8 @@ impl Default for AppConfig {
             download_allow_insecure: true,
             jobs_max_concurrent: 2,
             claude_model: "sonnet".to_string(),
+            llm_provider: "claude_code".to_string(),
+            llm_model: "sonnet".to_string(),
             claude_cmd: "claude".to_string(),
             api_key: String::new(),
             chrome_debug_port: 9222,
@@ -508,6 +549,11 @@ impl Default for AppConfig {
             aria2_host: "localhost".to_string(),
             aria2_port: 6800,
             aria2_secret: String::new(),
+            torznab_enabled: false,
+            torznab_endpoint: String::new(),
+            torznab_api_key: String::new(),
+            torznab_categories: String::new(),
+            torznab_max_results: 30,
             source_mode: "web".to_string(),
             source_endpoints: Vec::new(),
             source_sftp_host: String::new(),
@@ -539,12 +585,15 @@ macro_rules! apply_opt_fields {
 
 impl AppConfig {
     pub fn load() -> Self {
-        let mut cfg = Self::default();
-
         let config_path = find_config_file().unwrap_or_else(|| config_search_paths()[0].clone());
-        cfg.config_path = config_path.clone();
+        Self::load_from_path(&config_path)
+    }
 
-        let root = load_root_config(&config_path).unwrap_or_default();
+    pub fn load_from_path(path: &Path) -> Self {
+        let mut cfg = Self::default();
+        cfg.config_path = path.to_path_buf();
+
+        let root = load_root_config(path).unwrap_or_default();
         let RootConfig {
             top,
             rust,
@@ -604,6 +653,11 @@ impl AppConfig {
             file_cfg.download_timeout_seconds,
             10,
         );
+        set_opt_usize_min(
+            &mut self.torznab_max_results,
+            file_cfg.torznab_max_results,
+            1,
+        );
         apply_opt_fields!(
             self,
             file_cfg,
@@ -613,6 +667,8 @@ impl AppConfig {
                 download_dir,
                 download_allow_insecure,
                 claude_model,
+                llm_provider,
+                llm_model,
                 claude_cmd,
                 api_key,
                 chrome_debug_port,
@@ -638,6 +694,10 @@ impl AppConfig {
                 aria2_host,
                 aria2_port,
                 aria2_secret,
+                torznab_enabled,
+                torznab_endpoint,
+                torznab_api_key,
+                torznab_categories,
                 source_mode,
                 source_endpoints,
                 source_sftp_host,
@@ -656,6 +716,10 @@ impl AppConfig {
                 local_write_whitelist
             ]
         );
+
+        if self.llm_model.trim().is_empty() {
+            self.llm_model = self.claude_model.clone();
+        }
     }
 
     fn apply_env(&mut self) {

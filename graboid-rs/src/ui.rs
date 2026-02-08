@@ -118,7 +118,12 @@ pub fn render_login_page(error: bool) -> String {
         </div>
     };
 
-    render_document("Login - Graboid", LOGIN_CSS, None, body)
+    render_document(
+        "Login - Graboid",
+        LOGIN_CSS,
+        Some("/assets/graboid_frontend.js".to_string()),
+        body,
+    )
 }
 
 pub fn render_index_page(
@@ -504,7 +509,7 @@ fn render_job_detail_content(
 
     let logs_to_show = logs
         .iter()
-        .filter(|log| !log.source.starts_with("claude"))
+        .filter(|log| !log.source.starts_with("claude") && !log.source.starts_with("agent"))
         .rev()
         .take(80)
         .collect::<Vec<_>>();
@@ -865,6 +870,7 @@ fn render_nav(request: &RequestContext, git: &GitInfo, runtime: &RuntimeBadge) -
             {nav_link("/browser", "Browser", &request.path)}
             {nav_link("/notes", "Notes", &request.path)}
             {nav_link("/config", "Config", &request.path)}
+            {nav_link("/api/docs", "API", &request.path)}
             <div class="status-indicator">
                 <div class="status-dot" class:running=runtime.is_running id="status-dot"></div>
                 <span id="status-text">{status_text}</span>
@@ -1326,6 +1332,11 @@ fn render_config_content(
     let aria2_host = cfg_string(config, "aria2_host", "localhost");
     let aria2_port = cfg_i64(config, "aria2_port", 6800);
     let aria2_secret = cfg_string(config, "aria2_secret", "");
+    let torznab_enabled = cfg_bool(config, "torznab_enabled", false);
+    let torznab_endpoint = cfg_string(config, "torznab_endpoint", "");
+    let torznab_api_key = cfg_string(config, "torznab_api_key", "");
+    let torznab_categories = cfg_string(config, "torznab_categories", "");
+    let torznab_max_results = cfg_i64(config, "torznab_max_results", 30);
 
     let llm_provider = cfg_string(config, "llm_provider", "claude_code");
     let llm_model = cfg_string(config, "llm_model", "sonnet");
@@ -1503,31 +1514,29 @@ fn render_config_content(
         .collect::<Vec<_>>()
         .join("\n");
     let path_mapping_rows: Vec<View> = if path_mapping_pairs.is_empty() {
-        vec![
-            view! {
-                <div class="path-map-row" data-path-map-row="1">
-                    <input
-                        type="text"
-                        class="path-map-source"
-                        data-map-source="1"
-                        data-dir-autocomplete="1"
-                        placeholder="/host/path"
-                    />
-                    <span class="path-map-arrow">"→"</span>
-                    <input
-                        type="text"
-                        class="path-map-dest"
-                        data-map-dest="1"
-                        data-dir-autocomplete="1"
-                        placeholder="/container/path"
-                    />
-                    <button type="button" class="secondary path-map-remove" data-path-map-remove="1">
-                        "Delete"
-                    </button>
-                </div>
-            }
-            .into_view(),
-        ]
+        vec![view! {
+            <div class="path-map-row" data-path-map-row="1">
+                <input
+                    type="text"
+                    class="path-map-source"
+                    data-map-source="1"
+                    data-dir-autocomplete="1"
+                    placeholder="/host/path"
+                />
+                <span class="path-map-arrow">"→"</span>
+                <input
+                    type="text"
+                    class="path-map-dest"
+                    data-map-dest="1"
+                    data-dir-autocomplete="1"
+                    placeholder="/container/path"
+                />
+                <button type="button" class="secondary path-map-remove" data-path-map-remove="1">
+                    "Delete"
+                </button>
+            </div>
+        }
+        .into_view()]
     } else {
         path_mapping_pairs
             .iter()
@@ -1705,6 +1714,61 @@ fn render_config_content(
                             <label for="aria2_secret">"Secret Token"</label>
                             <input type="password" name="aria2_secret" id="aria2_secret" value=aria2_secret />
                         </div>
+
+                        <h3 style="margin-top: 1rem;">"Torznab Search"</h3>
+                        <label
+                            style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; margin-top: 0.3rem;"
+                        >
+                            <input
+                                type="checkbox"
+                                name="torznab_enabled"
+                                id="torznab_enabled"
+                                style="width: auto;"
+                                checked=torznab_enabled
+                            />
+                            <span>"Enable Torznab pre-search before browser navigation"</span>
+                        </label>
+                        <label for="torznab_endpoint">"Endpoint URL"</label>
+                        <input
+                            type="text"
+                            name="torznab_endpoint"
+                            id="torznab_endpoint"
+                            value=torznab_endpoint
+                            placeholder="http://127.0.0.1:9117/api/v2.0/indexers/all/results/torznab/"
+                        />
+                        <label for="torznab_api_key">"API Key"</label>
+                        <input
+                            type="text"
+                            name="torznab_api_key"
+                            id="torznab_api_key"
+                            value=torznab_api_key
+                        />
+                        <label for="torznab_categories">"Categories (optional)"</label>
+                        <input
+                            type="text"
+                            name="torznab_categories"
+                            id="torznab_categories"
+                            value=torznab_categories
+                            placeholder="5000,5040"
+                        />
+                        <label for="torznab_max_results">"Max Results"</label>
+                        <input
+                            type="number"
+                            name="torznab_max_results"
+                            id="torznab_max_results"
+                            value=torznab_max_results.to_string()
+                            min="1"
+                            max="200"
+                        />
+                        <div class="config-inline-actions">
+                            <button type="button" class="secondary" id="test-torznab">
+                                "Test Torznab"
+                            </button>
+                            <span id="torznab-test-result" class="config-inline-status">"Not tested"</span>
+                        </div>
+                        <p style="color: var(--text-dim); margin: 0.4rem 0 0;">
+                            "When enabled, Graboid queries Torznab with the job prompt for torrent candidates first."
+                        </p>
                     </div>
 
                     <div class="card">

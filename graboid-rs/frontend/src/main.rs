@@ -14,8 +14,8 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
-    Document, HtmlButtonElement, HtmlElement, HtmlFormElement, HtmlImageElement, HtmlInputElement,
-    HtmlSelectElement, HtmlTextAreaElement,
+    Document, EventSource, HtmlButtonElement, HtmlElement, HtmlFormElement, HtmlImageElement,
+    HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, MessageEvent,
 };
 
 #[component]
@@ -87,14 +87,32 @@ struct JobStepDetailView {
     screenshot_base64: Option<String>,
     #[serde(default)]
     notes: Vec<String>,
-    #[serde(default)]
-    claude_messages: Vec<String>,
+    #[serde(default, alias = "claude_messages")]
+    agent_messages: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct JobStepsResponse {
     #[serde(default)]
     steps: Vec<JobStepDetailView>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct JobLogView {
+    id: i64,
+    timestamp: String,
+    level: String,
+    source: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobDetailSnapshotView {
+    job: JobView,
+    #[serde(default)]
+    steps: Vec<JobStepDetailView>,
+    #[serde(default)]
+    logs: Vec<JobLogView>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +126,12 @@ struct TorrentTestResponse {
     success: bool,
     message: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    error: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -671,10 +695,119 @@ fn render_artifact_list(
         let Ok(anchor) = doc.create_element("a") else {
             continue;
         };
-        let _ = anchor.set_attribute("href", &format!("/jobs/{job_id}/artifacts/{kind}/{index}"));
+        let api_key = job_detail_api_key();
+        let href = if api_key.is_empty() {
+            format!("/api/v1/jobs/{job_id}/artifacts/{kind}/{index}")
+        } else {
+            format!("/api/v1/jobs/{job_id}/artifacts/{kind}/{index}?api_key={api_key}")
+        };
+        let _ = anchor.set_attribute("href", &href);
         let _ = anchor.append_child(&code);
         let _ = item.append_child(&anchor);
         let _ = container.append_child(&item);
+    }
+}
+
+fn job_detail_api_key() -> String {
+    web_document()
+        .and_then(|doc| doc.get_element_by_id("job-detail-root"))
+        .and_then(|node| node.get_attribute("data-api-key"))
+        .unwrap_or_default()
+}
+
+fn with_optional_api_key(base_path: &str, api_key: &str) -> String {
+    if api_key.trim().is_empty() {
+        base_path.to_string()
+    } else {
+        format!("{base_path}?api_key={}", encode_component(api_key))
+    }
+}
+
+fn render_job_logs(logs: &[JobLogView]) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(container) = doc.get_element_by_id("job-logs-body") else {
+        return;
+    };
+
+    let mut visible = logs
+        .iter()
+        .filter(|log| !log.source.starts_with("claude") && !log.source.starts_with("agent"))
+        .cloned()
+        .collect::<Vec<_>>();
+    visible.reverse();
+    if visible.len() > 80 {
+        visible.truncate(80);
+    }
+
+    let signature = visible
+        .iter()
+        .map(|log| format!("{}:{}:{}:{}", log.id, log.timestamp, log.level, log.message))
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    if !signature_changed(&container, &signature) {
+        return;
+    }
+
+    container.set_inner_html("");
+
+    if visible.is_empty() {
+        let Ok(row) = doc.create_element("tr") else {
+            return;
+        };
+        let Ok(cell) = doc.create_element("td") else {
+            return;
+        };
+        let _ = cell.set_attribute(
+            "style",
+            "color: var(--text-dim); text-align: center; padding: 1rem;",
+        );
+        let _ = cell.set_attribute("colspan", "4");
+        cell.set_text_content(Some("No system logs yet"));
+        let _ = row.append_child(&cell);
+        let _ = container.append_child(&row);
+        return;
+    }
+
+    for log in visible {
+        let Ok(row) = doc.create_element("tr") else {
+            continue;
+        };
+
+        let Ok(time_cell) = doc.create_element("td") else {
+            continue;
+        };
+        let _ = time_cell.set_attribute("style", "font-size: 0.8rem;");
+        time_cell.set_text_content(Some(&log.timestamp));
+
+        let Ok(level_cell) = doc.create_element("td") else {
+            continue;
+        };
+        let Ok(level_tag) = doc.create_element("span") else {
+            continue;
+        };
+        level_tag.set_class_name("tag");
+        level_tag.set_text_content(Some(&log.level));
+        let _ = level_cell.append_child(&level_tag);
+
+        let Ok(source_cell) = doc.create_element("td") else {
+            continue;
+        };
+        let _ = source_cell.set_attribute("style", "font-size: 0.85rem;");
+        source_cell.set_text_content(Some(&log.source));
+
+        let Ok(message_cell) = doc.create_element("td") else {
+            continue;
+        };
+        let _ = message_cell.set_attribute("style", "font-size: 0.85rem; white-space: pre-wrap;");
+        message_cell.set_text_content(Some(&truncate_text(&log.message, 240)));
+
+        let _ = row.append_child(&time_cell);
+        let _ = row.append_child(&level_cell);
+        let _ = row.append_child(&source_cell);
+        let _ = row.append_child(&message_cell);
+        let _ = container.append_child(&row);
     }
 }
 
@@ -898,7 +1031,7 @@ fn render_selected_step(steps: &[JobStepDetailView], state: &Rc<RefCell<StepCaro
         }
     }
 
-    render_agent_messages(&step.claude_messages);
+    render_agent_messages(&step.agent_messages);
     render_note_list(
         "job-step-notes",
         &step.notes,
@@ -988,6 +1121,123 @@ fn load_bootstrap_steps() -> Vec<JobStepDetailView> {
     serde_json::from_str::<Vec<JobStepDetailView>>(&raw).unwrap_or_default()
 }
 
+fn apply_job_detail_snapshot(
+    snapshot: JobDetailSnapshotView,
+    state: &Rc<RefCell<StepCarouselState>>,
+    steps_cache: &Rc<RefCell<Vec<JobStepDetailView>>>,
+    logs_cache: &Rc<RefCell<Vec<JobLogView>>>,
+) {
+    update_job_summary(&snapshot.job);
+
+    {
+        let mut cache = steps_cache.borrow_mut();
+        let mut state_mut = state.borrow_mut();
+        let previous_total = cache.len();
+        let was_at_latest = previous_total == 0 || state_mut.selected + 1 >= previous_total;
+
+        *cache = snapshot.steps;
+        state_mut.follow_latest = was_at_latest;
+    }
+    {
+        let steps = steps_cache.borrow();
+        render_selected_step(&steps, state);
+    }
+
+    {
+        let mut logs = logs_cache.borrow_mut();
+        *logs = snapshot.logs;
+    }
+    {
+        let logs = logs_cache.borrow();
+        render_job_logs(&logs);
+    }
+}
+
+fn queue_step_detail_refresh(
+    job_id: String,
+    api_key: String,
+    state: Rc<RefCell<StepCarouselState>>,
+    steps_cache: Rc<RefCell<Vec<JobStepDetailView>>>,
+    debounce: Rc<RefCell<Option<Timeout>>>,
+) {
+    if let Some(timeout) = debounce.borrow_mut().take() {
+        timeout.cancel();
+    }
+
+    let timeout = Timeout::new(140, move || {
+        let url = with_optional_api_key(&format!("/api/v1/jobs/{job_id}/steps/detail"), &api_key);
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        spawn_local(async move {
+            let Some(steps_response) = fetch_json::<JobStepsResponse>(&url).await else {
+                return;
+            };
+            {
+                let mut cache = steps_cache.borrow_mut();
+                *cache = steps_response.steps;
+            }
+            let steps = steps_cache.borrow();
+            render_selected_step(&steps, &state);
+        });
+    });
+    *debounce.borrow_mut() = Some(timeout);
+}
+
+fn parse_sse_event_data(event: web_sys::Event) -> Option<String> {
+    event
+        .dyn_into::<MessageEvent>()
+        .ok()
+        .and_then(|message| message.data().as_string())
+}
+
+fn start_job_detail_polling_fallback(
+    job_id: String,
+    api_key: String,
+    state: Rc<RefCell<StepCarouselState>>,
+    steps_cache: Rc<RefCell<Vec<JobStepDetailView>>>,
+    logs_cache: Rc<RefCell<Vec<JobLogView>>>,
+) {
+    let poll_inflight = Rc::new(RefCell::new(false));
+
+    let run_poll = {
+        let job_id = job_id.clone();
+        let api_key = api_key.clone();
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let logs_cache = logs_cache.clone();
+        let poll_inflight = poll_inflight.clone();
+
+        move || {
+            let job_id = job_id.clone();
+            let api_key = api_key.clone();
+            let state = state.clone();
+            let steps_cache = steps_cache.clone();
+            let logs_cache = logs_cache.clone();
+            let poll_inflight = poll_inflight.clone();
+
+            if *poll_inflight.borrow() {
+                return;
+            }
+            *poll_inflight.borrow_mut() = true;
+
+            spawn_local(async move {
+                let detail_url =
+                    with_optional_api_key(&format!("/api/v1/jobs/{job_id}/detail"), &api_key);
+                if let Some(snapshot) = fetch_json::<JobDetailSnapshotView>(&detail_url).await {
+                    apply_job_detail_snapshot(snapshot, &state, &steps_cache, &logs_cache);
+                }
+                *poll_inflight.borrow_mut() = false;
+            });
+        }
+    };
+
+    run_poll();
+    let interval = Interval::new(1500, move || {
+        run_poll();
+    });
+    interval.forget();
+}
+
 fn init_job_detail_live_updates() {
     let Some(doc) = web_document() else {
         return;
@@ -1009,7 +1259,7 @@ fn init_job_detail_live_updates() {
 
     let state = Rc::new(RefCell::new(StepCarouselState::new(selected_step)));
     let steps_cache = Rc::new(RefCell::new(Vec::<JobStepDetailView>::new()));
-    let poll_inflight = Rc::new(RefCell::new(false));
+    let logs_cache = Rc::new(RefCell::new(Vec::<JobLogView>::new()));
 
     install_step_nav_handlers(state.clone(), steps_cache.clone());
     {
@@ -1021,70 +1271,162 @@ fn init_job_detail_live_updates() {
         render_selected_step(&steps, &state);
     }
 
-    if api_key.trim().is_empty() {
+    let stream_url = with_optional_api_key(&format!("/api/v1/jobs/{job_id}/events"), &api_key);
+    let Ok(event_source) = EventSource::new(&stream_url) else {
+        start_job_detail_polling_fallback(job_id, api_key, state, steps_cache, logs_cache);
         return;
+    };
+
+    let step_refresh_debounce = Rc::new(RefCell::new(None::<Timeout>));
+
+    {
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let logs_cache = logs_cache.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(raw) = parse_sse_event_data(event) else {
+                return;
+            };
+            let Ok(snapshot) = serde_json::from_str::<JobDetailSnapshotView>(&raw) else {
+                return;
+            };
+            apply_job_detail_snapshot(snapshot, &state, &steps_cache, &logs_cache);
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("snapshot", callback.as_ref().unchecked_ref());
+        callback.forget();
     }
 
-    let run_poll = {
+    {
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(raw) = parse_sse_event_data(event) else {
+                return;
+            };
+            let Ok(job) = serde_json::from_str::<JobView>(&raw) else {
+                return;
+            };
+            update_job_summary(&job);
+            let steps = steps_cache.borrow();
+            render_selected_step(&steps, &state);
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("job_update", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    {
         let job_id = job_id.clone();
         let api_key = api_key.clone();
         let state = state.clone();
         let steps_cache = steps_cache.clone();
-        let poll_inflight = poll_inflight.clone();
+        let debounce = step_refresh_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            queue_step_detail_refresh(
+                job_id.clone(),
+                api_key.clone(),
+                state.clone(),
+                steps_cache.clone(),
+                debounce.clone(),
+            );
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("job_step", callback.as_ref().unchecked_ref());
+        let _ = event_source
+            .add_event_listener_with_callback("job_screenshot", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
 
-        move || {
-            let job_id = job_id.clone();
-            let api_key = api_key.clone();
-            let state = state.clone();
-            let steps_cache = steps_cache.clone();
-            let poll_inflight = poll_inflight.clone();
+    {
+        let job_id = job_id.clone();
+        let api_key = api_key.clone();
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let debounce = step_refresh_debounce.clone();
+        let logs_cache = logs_cache.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(raw) = parse_sse_event_data(event) else {
+                return;
+            };
+            let Ok(log) = serde_json::from_str::<JobLogView>(&raw) else {
+                return;
+            };
 
-            if *poll_inflight.borrow() {
+            let should_refresh_steps =
+                log.source.starts_with("claude") || log.source.starts_with("agent");
+            {
+                let mut logs = logs_cache.borrow_mut();
+                if !logs.iter().any(|existing| existing.id == log.id) {
+                    logs.push(log);
+                }
+            }
+            {
+                let logs = logs_cache.borrow();
+                render_job_logs(&logs);
+            }
+
+            if should_refresh_steps {
+                queue_step_detail_refresh(
+                    job_id.clone(),
+                    api_key.clone(),
+                    state.clone(),
+                    steps_cache.clone(),
+                    debounce.clone(),
+                );
+            }
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("job_log", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    {
+        let job_id = job_id.clone();
+        let api_key = api_key.clone();
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let debounce = step_refresh_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            queue_step_detail_refresh(
+                job_id.clone(),
+                api_key.clone(),
+                state.clone(),
+                steps_cache.clone(),
+                debounce.clone(),
+            );
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("complete", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    {
+        let job_id = job_id.clone();
+        let api_key = api_key.clone();
+        let state = state.clone();
+        let steps_cache = steps_cache.clone();
+        let logs_cache = logs_cache.clone();
+        let fallback_started = Rc::new(Cell::new(false));
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            if fallback_started.get() {
                 return;
             }
-            *poll_inflight.borrow_mut() = true;
+            fallback_started.set(true);
+            start_job_detail_polling_fallback(
+                job_id.clone(),
+                api_key.clone(),
+                state.clone(),
+                steps_cache.clone(),
+                logs_cache.clone(),
+            );
+        });
+        let _ = event_source
+            .add_event_listener_with_callback("error", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
 
-            spawn_local(async move {
-                let job_url = format!("/api/v1/jobs/{job_id}?api_key={api_key}");
-                let steps_url = format!("/api/v1/jobs/{job_id}/steps/detail?api_key={api_key}");
-
-                let Some(job) = fetch_json::<JobView>(&job_url).await else {
-                    *poll_inflight.borrow_mut() = false;
-                    return;
-                };
-                let Some(steps_response) = fetch_json::<JobStepsResponse>(&steps_url).await else {
-                    *poll_inflight.borrow_mut() = false;
-                    return;
-                };
-
-                update_job_summary(&job);
-
-                {
-                    let mut cache = steps_cache.borrow_mut();
-                    if steps_response.steps.len() >= cache.len() {
-                        *cache = steps_response.steps;
-                    }
-
-                    let mut state_mut = state.borrow_mut();
-                    if is_active_job_status(&job.status) {
-                        state_mut.follow_latest = true;
-                    } else if state_mut.selected + 1 < cache.len() {
-                        state_mut.follow_latest = false;
-                    }
-                }
-
-                let steps = steps_cache.borrow();
-                render_selected_step(&steps, &state);
-                *poll_inflight.borrow_mut() = false;
-            });
-        }
-    };
-
-    run_poll();
-    let interval = Interval::new(1000, move || {
-        run_poll();
-    });
-    interval.forget();
+    std::mem::forget(event_source);
 }
 
 fn encode_component(input: &str) -> String {
@@ -1143,6 +1485,100 @@ fn serialize_form_urlencoded(form: &HtmlFormElement) -> String {
 fn set_config_save_status(text: &str, class_name: &str) {
     set_text("config-save-status", text);
     set_class("config-save-status", class_name);
+}
+
+fn set_password_toggle_state(button: &HtmlButtonElement, revealed: bool) {
+    button.set_text_content(Some("👁"));
+    let label = if revealed {
+        "Hide password"
+    } else {
+        "Show password"
+    };
+    let _ = button.set_attribute("aria-label", label);
+    let _ = button.set_attribute("title", label);
+    let classes = button.class_list();
+    if revealed {
+        let _ = classes.add_1("revealed");
+    } else {
+        let _ = classes.remove_1("revealed");
+    }
+}
+
+fn ensure_password_toggle_input(input: &HtmlInputElement) {
+    if input.get_attribute("data-password-toggle-init").as_deref() == Some("1") {
+        return;
+    }
+
+    let Some(doc) = web_document() else {
+        return;
+    };
+
+    let wrapper = if let Some(parent) = input.parent_element() {
+        if parent.class_list().contains("password-field") {
+            let Ok(parent_html) = parent.dyn_into::<HtmlElement>() else {
+                return;
+            };
+            parent_html
+        } else {
+            let Ok(wrapper_node) = doc.create_element("div") else {
+                return;
+            };
+            let Ok(wrapper) = wrapper_node.dyn_into::<HtmlElement>() else {
+                return;
+            };
+            wrapper.set_class_name("password-field");
+            let _ = input.insert_adjacent_element("beforebegin", &wrapper);
+            let _ = wrapper.append_child(input);
+            wrapper
+        }
+    } else {
+        return;
+    };
+
+    let Ok(button_node) = doc.create_element("button") else {
+        return;
+    };
+    let Ok(button) = button_node.dyn_into::<HtmlButtonElement>() else {
+        return;
+    };
+    button.set_type("button");
+    button.set_class_name("password-toggle");
+    let _ = button.set_attribute("data-password-toggle-control", "1");
+
+    let input_ref = input.clone();
+    let button_ref = button.clone();
+    let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        event.prevent_default();
+        let is_password = input_ref.type_().eq_ignore_ascii_case("password");
+        input_ref.set_type(if is_password { "text" } else { "password" });
+        set_password_toggle_state(&button_ref, is_password);
+    });
+    let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+    callback.forget();
+
+    let _ = wrapper.append_child(&button);
+    let revealed = !input.type_().eq_ignore_ascii_case("password");
+    set_password_toggle_state(&button, revealed);
+    let _ = input.set_attribute("data-password-toggle-init", "1");
+}
+
+fn init_password_reveal_inputs() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Ok(inputs) = doc.query_selector_all("input[type='password']") else {
+        return;
+    };
+
+    for idx in 0..inputs.length() {
+        let Some(input) = inputs
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        ensure_password_toggle_input(&input);
+    }
 }
 
 fn sync_select_panel_visibility(select_id: &str, panel_class: &str, attr_name: &str) {
@@ -1681,15 +2117,32 @@ fn queue_config_autosave(form: HtmlFormElement, debounce: Rc<RefCell<Option<Time
                 .body(body);
 
             let Ok(request) = request else {
-                set_config_save_status("Save failed", "tag error");
+                set_config_save_status("Save failed: request build error", "tag error");
                 return;
             };
             match request.send().await {
-                Ok(response) if response.ok() => {
-                    set_config_save_status("Saved", "tag success");
+                Ok(response) => {
+                    if response.ok() {
+                        set_config_save_status("Saved", "tag success");
+                        return;
+                    }
+
+                    let status = response.status();
+                    let payload = response.json::<ApiErrorResponse>().await.ok();
+                    let message = if status == 401 {
+                        "Save failed: not authenticated".to_string()
+                    } else if let Some(detail) = payload
+                        .as_ref()
+                        .and_then(|body| body.detail.as_ref().or(body.error.as_ref()))
+                    {
+                        format!("Save failed: {detail}")
+                    } else {
+                        format!("Save failed (HTTP {status})")
+                    };
+                    set_config_save_status(&message, "tag error");
                 }
-                _ => {
-                    set_config_save_status("Save failed", "tag error");
+                Err(_) => {
+                    set_config_save_status("Save failed: connection error", "tag error");
                 }
             }
         });
@@ -1750,20 +2203,10 @@ fn set_model_suggestions(models: Vec<String>) {
 fn refresh_model_suggestions(provider: &str) {
     let provider = provider.trim().to_string();
     let fallback = static_model_suggestions(&provider);
-
-    let endpoint = match provider.as_str() {
-        "claude_code" => Some("/api/claude/models"),
-        "ollama" => Some("/api/ollama/models"),
-        _ => None,
-    };
-
-    let Some(endpoint) = endpoint else {
-        set_model_suggestions(fallback);
-        return;
-    };
+    let endpoint = format!("/api/llm/models?provider={provider}");
 
     spawn_local(async move {
-        let mut models = fetch_json::<ModelListResponse>(endpoint)
+        let mut models = fetch_json::<ModelListResponse>(&endpoint)
             .await
             .map(|response| response.models)
             .unwrap_or_default();
@@ -1801,33 +2244,56 @@ fn next_dir_autocomplete_id() -> String {
 struct DirectoryQuery {
     request_path: Option<String>,
     fallback_prefix: String,
+    fallback_parent: Option<String>,
 }
 
 fn parse_directory_query(value: &str) -> DirectoryQuery {
     let trimmed = value.trim().replace('\\', "/");
     if trimmed.is_empty() {
         return DirectoryQuery {
-            request_path: None,
+            request_path: Some("/".to_string()),
             fallback_prefix: String::new(),
+            fallback_parent: None,
         };
     }
 
     if trimmed.contains('/') {
-        let path = trimmed.trim_end_matches('/').to_string();
-        let request_path = if path.is_empty() {
-            Some("/".to_string())
-        } else {
-            Some(path)
-        };
+        if trimmed.ends_with('/') {
+            let path = trimmed.trim_end_matches('/').to_string();
+            let request_path = if path.is_empty() {
+                Some("/".to_string())
+            } else {
+                Some(path)
+            };
+            return DirectoryQuery {
+                request_path,
+                fallback_prefix: String::new(),
+                fallback_parent: None,
+            };
+        }
+
+        let (parent, prefix) = trimmed
+            .rsplit_once('/')
+            .map(|(left, right)| {
+                let parent = if left.is_empty() {
+                    "/".to_string()
+                } else {
+                    left.to_string()
+                };
+                (parent, right.to_string())
+            })
+            .unwrap_or_else(|| ("/".to_string(), String::new()));
         return DirectoryQuery {
-            request_path,
-            fallback_prefix: String::new(),
+            request_path: Some(trimmed),
+            fallback_prefix: prefix,
+            fallback_parent: Some(parent),
         };
     }
 
     DirectoryQuery {
         request_path: Some(".".to_string()),
         fallback_prefix: trimmed,
+        fallback_parent: None,
     }
 }
 
@@ -1975,10 +2441,19 @@ fn render_directory_suggestions(
 
     panel.set_inner_html("");
 
+    let payload_path = normalize_path_key(&payload.path);
+    let prefix_parent_matches = query
+        .fallback_parent
+        .as_deref()
+        .map(normalize_path_key)
+        .map(|parent| parent == payload_path)
+        .unwrap_or(false);
     let effective_prefix = if query.fallback_prefix.trim().is_empty() {
         String::new()
-    } else {
+    } else if prefix_parent_matches || query.request_path.as_deref() == Some(".") {
         query.fallback_prefix.trim().to_ascii_lowercase()
+    } else {
+        String::new()
     };
 
     let mut option_count = 0usize;
@@ -2011,7 +2486,6 @@ fn render_directory_suggestions(
         option_count += 1;
     }
 
-    let payload_path = normalize_path_key(&payload.path);
     let current_value = normalize_path_key(&input.value());
     let mut directories = payload.directories;
     directories.sort_by(|left, right| {
@@ -2248,6 +2722,7 @@ fn init_config_live_form() {
     ensure_local_path_row_exists("local-read-rows", "local-read-path", "/mnt/data");
     ensure_local_path_row_exists("local-write-rows", "local-write-path", "/mnt/downloads");
     init_directory_autocomplete_inputs();
+    init_password_reveal_inputs();
     refresh_model_suggestions_from_dom();
     set_config_save_status("Auto-save enabled", "tag");
 
@@ -2376,6 +2851,7 @@ fn init_config_live_form() {
             };
             if let Some(row) = create_source_endpoint_row("", "sftp", "", "", "", "", "") {
                 let _ = rows.append_child(&row);
+                init_password_reveal_inputs();
                 sync_source_endpoints_hidden();
                 queue_config_autosave(form_ref.clone(), debounce.clone());
             }
@@ -2407,6 +2883,7 @@ fn init_config_live_form() {
                 parent.remove();
             }
             ensure_source_endpoint_row_exists();
+            init_password_reveal_inputs();
             sync_source_endpoints_hidden();
             queue_config_autosave(form_ref.clone(), debounce.clone());
         });
@@ -2460,6 +2937,62 @@ fn init_config_live_form() {
                 } else {
                     set_text("torrent-test-result", "Unexpected response");
                     set_class("torrent-test-result", "config-inline-status error");
+                }
+            });
+        });
+        let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(button) = doc
+        .get_element_by_id("test-torznab")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            set_text("torznab-test-result", "Testing...");
+            set_class("torznab-test-result", "config-inline-status");
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            let body = serialize_form_urlencoded(&form_ref);
+            spawn_local(async move {
+                let request = Request::post("/api/test/torznab")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(body);
+                let Ok(request) = request else {
+                    set_text("torznab-test-result", "Request error");
+                    set_class("torznab-test-result", "config-inline-status error");
+                    return;
+                };
+
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(err) => {
+                        set_text("torznab-test-result", format!("Connection failed: {err}"));
+                        set_class("torznab-test-result", "config-inline-status error");
+                        return;
+                    }
+                };
+                let payload = response.json::<TorrentTestResponse>().await.ok();
+                if let Some(payload) = payload {
+                    if payload.success {
+                        let message = payload
+                            .message
+                            .unwrap_or_else(|| "Torznab connection successful".to_string());
+                        set_text("torznab-test-result", message);
+                        set_class("torznab-test-result", "config-inline-status success");
+                    } else {
+                        let message = payload
+                            .error
+                            .unwrap_or_else(|| "Torznab connection failed".to_string());
+                        set_text("torznab-test-result", message);
+                        set_class("torznab-test-result", "config-inline-status error");
+                    }
+                } else {
+                    set_text("torznab-test-result", "Unexpected response");
+                    set_class("torznab-test-result", "config-inline-status error");
                 }
             });
         });
@@ -2619,5 +3152,6 @@ fn main() {
 
     start_status_poller();
     init_job_detail_live_updates();
+    init_password_reveal_inputs();
     init_config_live_form();
 }

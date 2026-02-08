@@ -4,7 +4,9 @@ mod claude;
 mod config;
 mod db;
 mod events;
+mod mcp_tools;
 mod models;
+mod path_policy;
 mod runner;
 mod state;
 mod torrent;
@@ -29,6 +31,10 @@ use crate::state::{AppState, AuthConfig, GitInfo, RuntimeState};
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+
+    if std::env::args().nth(1).as_deref() == Some("mcp-tools") {
+        return mcp_tools::run_stdio_server_from_cli().await;
+    }
 
     let config = Arc::new(AppConfig::load());
     let runtime = Arc::new(RuntimeState::new(500, 100));
