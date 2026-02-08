@@ -9,6 +9,64 @@ use crate::state::{AgentMessage, GitInfo};
 
 const BASE_CSS: &str = include_str!("ui_assets/base.css");
 const LOGIN_CSS: &str = include_str!("ui_assets/login.css");
+const AUTO_RELOAD_SCRIPT: &str = r#"(function () {
+  const version = document.getElementById("build-version");
+  if (!version) return;
+
+  let inflight = false;
+
+  function readCurrent() {
+    return {
+      beHash: version.getAttribute("data-backend-hash") || "",
+      beEpoch: version.getAttribute("data-backend-epoch") || "",
+      feHash: version.getAttribute("data-frontend-hash") || "",
+      feEpoch: version.getAttribute("data-frontend-epoch") || "",
+    };
+  }
+
+  let baseline = readCurrent();
+
+  function changed(before, after) {
+    return Boolean(before) && before !== after;
+  }
+
+  async function poll() {
+    if (inflight) return;
+    inflight = true;
+    try {
+      const response = await fetch("/api/status", { cache: "no-store" });
+      if (!response.ok) return;
+
+      const data = await response.json();
+      const backend = (data && data.git && data.git.backend) || {};
+      const frontend = (data && data.git && data.git.frontend) || {};
+      const next = {
+        beHash: String(backend.hash ?? ""),
+        beEpoch: String(backend.epoch ?? ""),
+        feHash: String(frontend.hash ?? ""),
+        feEpoch: String(frontend.epoch ?? ""),
+      };
+
+      const backendChanged =
+        changed(baseline.beHash, next.beHash) ||
+        changed(baseline.beEpoch, next.beEpoch);
+      const frontendChanged =
+        changed(baseline.feHash, next.feHash) ||
+        changed(baseline.feEpoch, next.feEpoch);
+
+      if (backendChanged || frontendChanged) {
+        window.location.reload();
+      }
+    } catch (_err) {
+      // Ignore transient network failures during restarts.
+    } finally {
+      inflight = false;
+      baseline = readCurrent();
+    }
+  }
+
+  window.setInterval(poll, 2000);
+})();"#;
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -107,14 +165,7 @@ pub fn render_index_page(
         </>
     };
 
-    render_app_page_with_refresh(
-        request,
-        git,
-        runtime,
-        "Dashboard - Graboid",
-        Some(5),
-        content,
-    )
+    render_app_page(request, git, runtime, "Dashboard - Graboid", content)
 }
 
 pub fn render_config_page(
@@ -143,14 +194,7 @@ pub fn render_notes_page(
     domain_notes: &BTreeMap<String, Vec<NoteEntry>>,
 ) -> String {
     let content = render_notes_content(stats, domains, domain_notes);
-    render_app_page_with_refresh(
-        request,
-        git,
-        runtime,
-        "Agent Notes - Graboid",
-        Some(10),
-        content,
-    )
+    render_app_page(request, git, runtime, "Agent Notes - Graboid", content)
 }
 
 pub fn render_browser_page(
@@ -245,14 +289,7 @@ pub fn render_browser_page(
         </>
     };
 
-    render_app_page_with_refresh(
-        request,
-        git,
-        runtime,
-        "Browser View - Graboid",
-        Some(3),
-        content,
-    )
+    render_app_page(request, git, runtime, "Browser View - Graboid", content)
 }
 
 pub fn render_jobs_page(
@@ -267,12 +304,7 @@ pub fn render_jobs_page(
     message: Option<&str>,
 ) -> String {
     let content = render_jobs_content(request, api_key, jobs, total, offset, limit, message);
-    let refresh = if jobs.iter().any(|job| is_active_status(job.status)) {
-        Some(5)
-    } else {
-        Some(15)
-    };
-    render_app_page_with_refresh(request, git, runtime, "Jobs - Graboid", refresh, content)
+    render_app_page(request, git, runtime, "Jobs - Graboid", content)
 }
 
 pub fn render_job_detail_page(
@@ -287,12 +319,7 @@ pub fn render_job_detail_page(
     let short_id: String = job.id.chars().take(8).collect();
     let title = format!("Job {short_id} - Graboid");
     let content = render_job_detail_content(request, api_key, job, steps, logs);
-    let refresh = if is_active_status(job.status) {
-        Some(3)
-    } else {
-        Some(12)
-    };
-    render_app_page_with_refresh(request, git, runtime, &title, refresh, content)
+    render_app_page(request, git, runtime, &title, content)
 }
 
 fn render_job_detail_content(
@@ -332,10 +359,22 @@ fn render_job_detail_content(
         format!("Step {}/{}", selected_step + 1, total_steps)
     };
     let step_title = selected_step_detail
-        .map(|step| format!("Step {}: {}", step.step_number, step.action))
+        .map(|step| {
+            format!(
+                "Step {}: {}",
+                step.step_number,
+                truncate_text(&step.action, 100)
+            )
+        })
         .unwrap_or_else(|| "No navigation steps yet".to_string());
     let step_meta = selected_step_detail
-        .map(|step| format!("{} | {}", step.timestamp.to_rfc3339(), step.url))
+        .map(|step| {
+            format!(
+                "{} | {}",
+                format_relative_age(step.timestamp.timestamp()),
+                step.url
+            )
+        })
         .unwrap_or_else(|| "Waiting for first navigation step".to_string());
     let step_observation = selected_step_detail
         .map(|step| step.observation.clone())
@@ -347,30 +386,36 @@ fn render_job_detail_content(
         .and_then(|step| step.screenshot_base64.as_ref())
         .map(|base64| format!("data:image/png;base64,{base64}"))
         .unwrap_or_default();
-    let screenshot_visible_style = if step_screenshot_src.is_empty() {
-        "width: 100%; aspect-ratio: 5/4; object-fit: cover; border-radius: 0.4rem; background: #000; display: none;"
+    let step_image_wrap_style = if step_screenshot_src.is_empty() {
+        "display: none;"
     } else {
-        "width: 100%; aspect-ratio: 5/4; object-fit: cover; border-radius: 0.4rem; background: #000; display: block;"
+        "display: block;"
     };
-    let screenshot_placeholder_style = if step_screenshot_src.is_empty() {
-        "min-height: 420px; display: flex; align-items: center; justify-content: center; background: #000; border-radius: 0.4rem;"
-    } else {
-        "min-height: 420px; display: none; align-items: center; justify-content: center; background: #000; border-radius: 0.4rem;"
-    };
+    let screenshot_visible_style = "width: 100%; aspect-ratio: 5/4; object-fit: cover; border-radius: 0.4rem; background: #000; display: block;";
     let step_error_style = if step_has_error {
         String::new()
     } else {
         "display: none;".to_string()
     };
-    let prev_href = if total_steps == 0 || selected_step == 0 {
-        None
+    let can_step_prev = total_steps > 0 && selected_step > 0;
+    let can_step_next = total_steps > 0 && selected_step + 1 < total_steps;
+    let created_relative = format_relative_age(job.created_at.timestamp());
+    let updated_relative = format_relative_age(job.updated_at.timestamp());
+    let duration_end = if is_active_status(job.status) {
+        Utc::now().timestamp()
     } else {
-        Some(format!("/jobs/{}?step={}", job.id, selected_step))
+        job.updated_at.timestamp()
     };
-    let next_href = if total_steps == 0 || selected_step + 1 >= total_steps {
-        None
+    let job_duration = format_elapsed_duration((duration_end - job.created_at.timestamp()).max(0));
+    let prev_button_style = if can_step_prev {
+        String::new()
     } else {
-        Some(format!("/jobs/{}?step={}", job.id, selected_step + 2))
+        "opacity: 0.5; pointer-events: none;".to_string()
+    };
+    let next_button_style = if can_step_next {
+        String::new()
+    } else {
+        "opacity: 0.5; pointer-events: none;".to_string()
     };
 
     let action_form = if is_active_status(job.status) {
@@ -460,9 +505,17 @@ fn render_job_detail_content(
     };
 
     let found_url_items = render_string_list(&job.found_urls, "No URLs found yet.");
-    let downloaded_file_items =
-        render_string_list(&job.downloaded_files, "No downloaded files yet.");
-    let final_path_items = render_string_list(&job.final_paths, "No final paths yet.");
+    let downloaded_file_items = render_artifact_list(
+        &job.id,
+        "downloaded",
+        &job.downloaded_files,
+        "No downloaded files yet.",
+    );
+    let final_path_items =
+        render_artifact_list(&job.id, "final", &job.final_paths, "No final paths yet.");
+    let steps_bootstrap_json = serde_json::to_string(steps)
+        .unwrap_or_else(|_| "[]".to_string())
+        .replace("</", "<\\/");
 
     view! {
         <>
@@ -470,6 +523,8 @@ fn render_job_detail_content(
                 id="job-detail-root"
                 class="job-detail-root"
                 data-job-id=job.id.clone()
+                data-api-key=api_key.to_string()
+                data-selected-step=selected_step.to_string()
             >
                 <h1>{format!("Job {}", job.id)}</h1>
                 <div class="card job-toolbar">
@@ -493,37 +548,31 @@ fn render_job_detail_content(
                 <div class="job-detail-layout">
                     <div class="card job-step-card">
                         <div class="job-step-header">
-                            {prev_href
-                                .map(|href| {
-                                    view! { <a id="job-step-prev" href=href class="btn secondary job-step-nav">"<"</a> }
-                                        .into_view()
-                                })
-                                .unwrap_or_else(|| {
-                                    view! {
-                                        <span id="job-step-prev" class="btn secondary job-step-nav" style="opacity: 0.5; pointer-events: none;">
-                                            "<"
-                                        </span>
-                                    }
-                                        .into_view()
-                                })}
+                            <button
+                                id="job-step-prev"
+                                type="button"
+                                class="btn secondary job-step-nav"
+                                style=prev_button_style
+                                aria-disabled=(!can_step_prev).to_string()
+                                aria-label="Previous step"
+                            >
+                                "<"
+                            </button>
                             <div class="job-step-headtext">
                                 <h2 id="job-step-title">{step_title}</h2>
                                 <div id="job-step-counter" class="job-step-counter">{step_counter}</div>
                                 <div id="job-step-meta" class="job-step-meta">{step_meta}</div>
                             </div>
-                            {next_href
-                                .map(|href| {
-                                    view! { <a id="job-step-next" href=href class="btn secondary job-step-nav">">"</a> }
-                                        .into_view()
-                                })
-                                .unwrap_or_else(|| {
-                                    view! {
-                                        <span id="job-step-next" class="btn secondary job-step-nav" style="opacity: 0.5; pointer-events: none;">
-                                            ">"
-                                        </span>
-                                    }
-                                        .into_view()
-                                })}
+                            <button
+                                id="job-step-next"
+                                type="button"
+                                class="btn secondary job-step-nav"
+                                style=next_button_style
+                                aria-disabled=(!can_step_next).to_string()
+                                aria-label="Next step"
+                            >
+                                ">"
+                            </button>
                         </div>
 
                         <div id="job-step-observation" class="job-step-observation">{step_observation}</div>
@@ -531,16 +580,13 @@ fn render_job_detail_content(
                             <span id="job-step-error-tag" class="tag error" style=step_error_style>"Error"</span>
                         </div>
 
-                        <div class="job-step-image-wrap">
+                        <div id="job-step-image-wrap" class="job-step-image-wrap" style=step_image_wrap_style>
                             <img
                                 id="job-step-image"
                                 src=step_screenshot_src
                                 alt="Step screenshot"
                                 style=screenshot_visible_style
                             />
-                            <div id="job-step-image-placeholder" class="placeholder" style=screenshot_placeholder_style>
-                                "No screenshot for this step"
-                            </div>
                         </div>
 
                         <h3 class="job-subtitle">"Claude"</h3>
@@ -553,8 +599,9 @@ fn render_job_detail_content(
                         <div class="card job-summary-card">
                             <h2>"Summary"</h2>
                             <table class="job-compact-table">
-                                <tr><td style="color: var(--text-dim);">"Created"</td><td id="job-created-text">{job.created_at.to_rfc3339()}</td></tr>
-                                <tr><td style="color: var(--text-dim);">"Updated"</td><td id="job-updated-text">{job.updated_at.to_rfc3339()}</td></tr>
+                                <tr><td style="color: var(--text-dim);">"Created"</td><td id="job-created-text">{created_relative}</td></tr>
+                                <tr><td style="color: var(--text-dim);">"Updated"</td><td id="job-updated-text">{updated_relative}</td></tr>
+                                <tr><td style="color: var(--text-dim);">"Ran for"</td><td id="job-duration-text">{job_duration}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Source"</td><td id="job-source-url-text">{source_url}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Destination"</td><td id="job-destination-text">{job.destination_path.clone()}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Operation"</td><td id="job-operation-text">{job.file_operation.clone()}</td></tr>
@@ -621,6 +668,11 @@ fn render_job_detail_content(
                     </table>
                 </details>
             </section>
+            <script
+                id="job-steps-bootstrap"
+                type="application/json"
+                inner_html=steps_bootstrap_json
+            ></script>
         </>
     }
     .into_view()
@@ -643,6 +695,41 @@ fn render_string_list(values: &[String], empty_message: &str) -> Vec<View> {
         .collect()
 }
 
+fn render_artifact_list(
+    job_id: &str,
+    kind: &str,
+    values: &[String],
+    empty_message: &str,
+) -> Vec<View> {
+    if values.is_empty() {
+        return vec![
+            view! { <li style="color: var(--text-dim);">{empty_message.to_string()}</li> }
+                .into_view(),
+        ];
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.starts_with("torrent:") {
+                return view! { <li><code style="word-break: break-word;">{value.clone()}</code></li> }
+                    .into_view();
+            }
+
+            let href = format!("/jobs/{job_id}/artifacts/{kind}/{index}");
+            view! {
+                <li>
+                    <a href=href>
+                        <code style="word-break: break-word;">{value.clone()}</code>
+                    </a>
+                </li>
+            }
+            .into_view()
+        })
+        .collect()
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -658,17 +745,11 @@ fn render_app_page(
     title: &str,
     content: impl IntoView,
 ) -> String {
-    render_app_page_with_refresh(request, git, runtime, title, None, content)
-}
-
-fn render_app_page_with_refresh(
-    request: &RequestContext,
-    git: &GitInfo,
-    runtime: &RuntimeBadge,
-    title: &str,
-    refresh_seconds: Option<u32>,
-    content: impl IntoView,
-) -> String {
+    let asset_version = format!(
+        "{}-{}-{}-{}",
+        git.backend.hash, git.backend.epoch, git.frontend.hash, git.frontend.epoch
+    );
+    let script_src = format!("/assets/graboid_frontend.js?v={asset_version}");
     let body = view! {
         <>
             {render_nav(request, git, runtime)}
@@ -676,37 +757,45 @@ fn render_app_page_with_refresh(
         </>
     };
 
-    render_document(title, BASE_CSS, refresh_seconds, body)
+    render_document(title, BASE_CSS, Some(script_src), body)
 }
 
 fn render_document(
     title: &str,
     css: &str,
-    refresh_seconds: Option<u32>,
+    script_src: Option<String>,
     body: impl IntoView,
 ) -> String {
     let runtime = create_runtime();
-    let refresh_meta = refresh_seconds
-        .filter(|seconds| *seconds > 0)
-        .map(|seconds| {
-            view! {
-                <meta http-equiv="refresh" content=seconds.to_string() />
-            }
-            .into_view()
-        });
+    let module_script = script_src.as_ref().map(|src| {
+        let loader = format!(
+            "import init from '{}'; init().catch((err) => console.error('graboid frontend init failed', err));",
+            src
+        );
+        view! {
+            <script type="module" inner_html=loader></script>
+        }
+        .into_view()
+    });
+    let reload_script = script_src.as_ref().map(|_| {
+        view! {
+            <script>{AUTO_RELOAD_SCRIPT}</script>
+        }
+        .into_view()
+    });
 
     let rendered = view! {
         <html lang="en">
             <head>
                 <meta charset="UTF-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-                {refresh_meta}
                 <title>{title.to_string()}</title>
                 <style inner_html=css.to_string()></style>
             </head>
             <body>
                 {body}
-                <script type="module" src="/assets/graboid_frontend.js"></script>
+                {reload_script}
+                {module_script}
             </body>
         </html>
     }
@@ -804,29 +893,47 @@ fn format_relative_age(epoch: i64) -> String {
     let future = diff < 0;
     let delta = diff.abs();
 
-    if delta < 5 {
-        return "just now".to_string();
+    if delta < 60 {
+        return if future {
+            "in <1m".to_string()
+        } else {
+            "<1m ago".to_string()
+        };
     }
 
-    let units = [
-        (86_400_i64, "d"),
-        (3_600_i64, "h"),
-        (60_i64, "m"),
-        (1_i64, "s"),
-    ];
+    let (value, suffix) = if delta < 3_600 {
+        (delta / 60, "m")
+    } else if delta < 86_400 {
+        (delta / 3_600, "h")
+    } else {
+        (delta / 86_400, "d")
+    };
 
-    for (seconds, suffix) in units {
-        if delta >= seconds {
-            let value = delta / seconds;
-            return if future {
-                format!("in {value}{suffix}")
-            } else {
-                format!("{value}{suffix} ago")
-            };
-        }
+    if future {
+        format!("in {value}{suffix}")
+    } else {
+        format!("{value}{suffix} ago")
+    }
+}
+
+fn format_elapsed_duration(seconds: i64) -> String {
+    if seconds < 0 {
+        return "-".to_string();
     }
 
-    "-".to_string()
+    let mut remaining = seconds;
+    let hours = remaining / 3_600;
+    remaining %= 3_600;
+    let minutes = remaining / 60;
+    let secs = remaining % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {secs}s")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn job_status_class(status: JobStatus) -> &'static str {

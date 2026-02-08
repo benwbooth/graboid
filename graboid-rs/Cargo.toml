@@ -45,4 +45,5 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 walkdir = "2.5"
 which = "8.0"
 xz2 = "0.1"
+zstd = "0.13"
 zip = { version = "2.4", default-features = false, features = ["deflate", "bzip2", "lzma", "zstd"] }

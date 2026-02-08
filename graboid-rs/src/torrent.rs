@@ -1,9 +1,14 @@
 use std::future::Future;
+use std::path::PathBuf;
 #[cfg(feature = "librqbit-embedded")]
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "librqbit-embedded")]
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "librqbit-embedded")]
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -21,6 +26,36 @@ pub async fn add_torrent(cfg: &AppConfig, source: &str) -> Result<String> {
         "transmission" => add_transmission(cfg, source).await,
         "aria2" => add_aria2(cfg, source).await,
         unsupported => bail!("unsupported torrent client: {unsupported}"),
+    }
+}
+
+pub async fn selective_fetch_from_torrent(
+    cfg: &AppConfig,
+    source: &str,
+    prompt: &str,
+    file_filter: &[String],
+) -> Result<Vec<PathBuf>> {
+    if file_filter.is_empty() {
+        bail!("file_filter is empty; selective torrent fetch requires desired file patterns")
+    }
+    if !matches!(cfg.torrent_client.as_str(), "embedded" | "auto") {
+        bail!(
+            "selective torrent fetch currently requires torrent_client=embedded or auto (current: {})",
+            cfg.torrent_client
+        );
+    }
+
+    #[cfg(feature = "librqbit-embedded")]
+    {
+        selective_fetch_embedded(cfg, source, prompt, file_filter).await
+    }
+
+    #[cfg(not(feature = "librqbit-embedded"))]
+    {
+        let _ = (cfg, source, prompt, file_filter);
+        bail!(
+            "selective torrent fetch requires embedded backend support (enable cargo feature `librqbit-embedded`)"
+        );
     }
 }
 
@@ -53,7 +88,134 @@ async fn add_embedded(cfg: &AppConfig, source: &str) -> Result<String> {
 
 #[cfg(feature = "librqbit-embedded")]
 async fn add_embedded_librqbit(cfg: &AppConfig, source: &str) -> Result<String> {
-    use librqbit::{AddTorrent, Session, SessionOptions, SessionPersistenceConfig};
+    let session = embedded_session(cfg).await?;
+    let add_request = build_embedded_add_request(source).await?;
+
+    session
+        .add_torrent(add_request, None)
+        .await
+        .context("embedded torrent add failed")?;
+
+    Ok(extract_magnet_hash(source).unwrap_or_else(|| fallback_torrent_id("embedded", source)))
+}
+
+#[cfg(feature = "librqbit-embedded")]
+async fn selective_fetch_embedded(
+    cfg: &AppConfig,
+    source: &str,
+    prompt: &str,
+    file_filter: &[String],
+) -> Result<Vec<PathBuf>> {
+    use librqbit::{AddTorrentOptions, AddTorrentResponse};
+
+    let session = embedded_session(cfg).await?;
+    let list_response = tokio::time::timeout(
+        Duration::from_secs(90),
+        session.add_torrent(
+            build_embedded_add_request(source).await?,
+            Some(AddTorrentOptions {
+                list_only: true,
+                paused: true,
+                overwrite: true,
+                output_folder: Some(cfg.download_dir().display().to_string()),
+                ..Default::default()
+            }),
+        ),
+    )
+    .await
+    .context("timed out while listing torrent contents")?
+    .context("failed to list torrent contents")?;
+
+    let list = match list_response {
+        AddTorrentResponse::ListOnly(list) => list,
+        _ => bail!("torrent list_only mode returned unexpected response"),
+    };
+
+    let selected = select_torrent_files(&list.info, prompt, file_filter)?;
+    if selected.file_indices.is_empty() {
+        bail!("no suitable torrent files matched prompt/file_filter");
+    }
+
+    let selected_set = selected
+        .file_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let output_folder = list.output_folder.clone();
+    let add_opts = AddTorrentOptions {
+        paused: false,
+        overwrite: true,
+        output_folder: Some(output_folder.display().to_string()),
+        only_files: Some(selected.file_indices.clone()),
+        ..Default::default()
+    };
+    let add_response = session
+        .add_torrent(build_embedded_add_request(source).await?, Some(add_opts))
+        .await
+        .context("failed starting selective torrent download")?;
+
+    let (torrent_id, handle) = match add_response {
+        AddTorrentResponse::Added(id, handle) => (id, handle),
+        AddTorrentResponse::AlreadyManaged(id, handle) => {
+            session
+                .update_only_files(&handle, &selected_set)
+                .await
+                .context("failed updating existing torrent file selection")?;
+            session
+                .unpause(&handle)
+                .await
+                .context("failed unpausing existing torrent")?;
+            (id, handle)
+        }
+        AddTorrentResponse::ListOnly(_) => {
+            bail!("torrent add returned list-only response unexpectedly")
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(90), handle.wait_until_initialized())
+        .await
+        .context("timed out waiting for torrent metadata initialization")?
+        .context("torrent initialization failed")?;
+
+    let selective_timeout = cfg.download_timeout_seconds.max(120);
+    tokio::time::timeout(
+        Duration::from_secs(selective_timeout),
+        handle.wait_until_completed(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out waiting for selective torrent download after {}s",
+            selective_timeout
+        )
+    })?
+    .context("selective torrent download failed")?;
+
+    let mut paths = handle
+        .with_metadata(|metadata| {
+            selected
+                .file_indices
+                .iter()
+                .filter_map(|idx| metadata.file_infos.get(*idx))
+                .map(|fi| output_folder.join(&fi.relative_filename))
+                .collect::<Vec<PathBuf>>()
+        })
+        .context("failed resolving selected torrent file paths")?;
+    paths.retain(|path| path.exists());
+    if paths.is_empty() {
+        bail!("selected torrent files did not materialize on disk");
+    }
+
+    let _ = session
+        .delete(librqbit::api::TorrentIdOrHash::Id(torrent_id), false)
+        .await;
+
+    Ok(paths)
+}
+
+#[cfg(feature = "librqbit-embedded")]
+async fn embedded_session(cfg: &AppConfig) -> Result<Arc<librqbit::Session>> {
+    use librqbit::{Session, SessionOptions, SessionPersistenceConfig};
     use tokio::sync::OnceCell;
 
     static SESSION: OnceCell<Arc<Session>> = OnceCell::const_new();
@@ -78,7 +240,7 @@ async fn add_embedded_librqbit(cfg: &AppConfig, source: &str) -> Result<String> 
             )
         })?;
 
-    let session = SESSION
+    SESSION
         .get_or_try_init(|| async {
             let mut options = SessionOptions::default();
             options.fastresume = true;
@@ -91,27 +253,27 @@ async fn add_embedded_librqbit(cfg: &AppConfig, source: &str) -> Result<String> 
                 .context("failed initializing embedded librqbit session")?;
             Ok::<Arc<Session>, anyhow::Error>(session)
         })
-        .await?
-        .clone();
+        .await
+        .cloned()
+}
 
-    let add_request = if source.starts_with("magnet:")
+#[cfg(feature = "librqbit-embedded")]
+async fn build_embedded_add_request(source: &str) -> Result<librqbit::AddTorrent<'static>> {
+    if source.starts_with("magnet:")
         || source.starts_with("http://")
         || source.starts_with("https://")
     {
-        AddTorrent::from_url(source)
-    } else {
-        let bytes = tokio::fs::read(source)
-            .await
-            .with_context(|| format!("failed reading torrent file {source}"))?;
-        AddTorrent::from_bytes(bytes)
-    };
+        return Ok(librqbit::AddTorrent::from_url(source.to_string()));
+    }
 
-    session
-        .add_torrent(add_request, None)
+    if source.trim().is_empty() {
+        bail!("empty torrent source");
+    }
+
+    let bytes = tokio::fs::read(source)
         .await
-        .context("embedded torrent add failed")?;
-
-    Ok(extract_magnet_hash(source).unwrap_or_else(|| fallback_torrent_id("embedded", source)))
+        .with_context(|| format!("failed reading torrent file {source}"))?;
+    Ok(librqbit::AddTorrent::from_bytes(bytes))
 }
 
 async fn add_qbittorrent(cfg: &AppConfig, source: &str) -> Result<String> {
@@ -523,6 +685,154 @@ async fn rtorrent_rpc(
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "librqbit-embedded")]
+struct SelectedTorrentFiles {
+    file_indices: Vec<usize>,
+}
+
+#[cfg(feature = "librqbit-embedded")]
+fn select_torrent_files(
+    info: &librqbit::TorrentMetaV1Info<librqbit::ByteBufOwned>,
+    prompt: &str,
+    file_filter: &[String],
+) -> Result<SelectedTorrentFiles> {
+    let matcher = build_filter_matcher(file_filter)?;
+    let keywords = build_keywords(prompt, file_filter);
+
+    let mut direct_matches = Vec::<(usize, i64, u64)>::new();
+    let mut archive_matches = Vec::<(usize, i64, u64)>::new();
+
+    for (idx, details) in info
+        .iter_file_details()
+        .context("failed to iterate torrent files")?
+        .enumerate()
+    {
+        let filename = details
+            .filename
+            .to_string()
+            .unwrap_or_else(|_| "<invalid-name>".to_string());
+        let path = Path::new(&filename);
+        let lower = filename.to_ascii_lowercase();
+        let size = details.len;
+
+        let mut score = 0_i64;
+        for keyword in &keywords {
+            if lower.contains(keyword) {
+                score += 8;
+            }
+        }
+        if lower.contains("sample") || lower.contains("preview") {
+            score -= 12;
+        }
+        score += ((size / (128 * 1024 * 1024)) as i64).min(24);
+
+        let matched_filter = matcher.as_ref().map(|m| m.is_match(path)).unwrap_or(false);
+
+        if matched_filter && !is_archive_filename(&lower) {
+            direct_matches.push((idx, score + 30, size));
+            continue;
+        }
+
+        if is_archive_filename(&lower) {
+            let archive_boost = if matched_filter { 25 } else { 0 };
+            archive_matches.push((idx, score + archive_boost + 15, size));
+        }
+    }
+
+    if !direct_matches.is_empty() {
+        direct_matches.sort_by(|l, r| r.1.cmp(&l.1).then_with(|| r.2.cmp(&l.2)));
+        let selected = direct_matches
+            .into_iter()
+            .map(|(idx, _, _)| idx)
+            .take(8)
+            .collect::<Vec<_>>();
+        return Ok(SelectedTorrentFiles {
+            file_indices: selected,
+        });
+    }
+
+    archive_matches.sort_by(|l, r| r.1.cmp(&l.1).then_with(|| r.2.cmp(&l.2)));
+    let selected = archive_matches
+        .into_iter()
+        .map(|(idx, _, _)| idx)
+        .take(1)
+        .collect::<Vec<_>>();
+
+    Ok(SelectedTorrentFiles {
+        file_indices: selected,
+    })
+}
+
+#[cfg(feature = "librqbit-embedded")]
+fn build_filter_matcher(file_filter: &[String]) -> Result<Option<GlobSet>> {
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0usize;
+    for raw in file_filter {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(glob) = Glob::new(trimmed) {
+            builder.add(glob);
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        builder
+            .build()
+            .context("failed compiling torrent filter matcher")?,
+    ))
+}
+
+#[cfg(feature = "librqbit-embedded")]
+fn build_keywords(prompt: &str, file_filter: &[String]) -> Vec<String> {
+    let mut keywords = HashSet::new();
+    for source in std::iter::once(prompt).chain(file_filter.iter().map(String::as_str)) {
+        for token in source
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+        {
+            let token = token.trim();
+            if token.len() < 2 {
+                continue;
+            }
+            if matches!(
+                token,
+                "the"
+                    | "and"
+                    | "for"
+                    | "from"
+                    | "with"
+                    | "file"
+                    | "files"
+                    | "download"
+                    | "archive"
+                    | "rom"
+                    | "set"
+            ) {
+                continue;
+            }
+            keywords.insert(token.to_string());
+        }
+    }
+    let mut values = keywords.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+#[cfg(feature = "librqbit-embedded")]
+fn is_archive_filename(filename_lower: &str) -> bool {
+    [
+        ".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+        ".tar.zst", ".tzst", ".zst", ".gz", ".bz2", ".xz",
+    ]
+    .iter()
+    .any(|suffix| filename_lower.ends_with(suffix))
 }
 
 fn extract_magnet_hash(source: &str) -> Option<String> {

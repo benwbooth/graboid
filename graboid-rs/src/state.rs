@@ -21,6 +21,7 @@ pub struct AppState {
     pub runner: Arc<JobRunner>,
     pub events: broadcast::Sender<ServerEvent>,
     pub runtime: Arc<RuntimeState>,
+    pub project_root: PathBuf,
     pub git_info: GitInfo,
     pub auth: AuthConfig,
     pub config_path: PathBuf,
@@ -78,19 +79,26 @@ fn capture_backend_stamp() -> BuildStamp {
 }
 
 fn capture_frontend_stamp(project_root: &Path) -> BuildStamp {
-    let mut wasm_files = collect_frontend_wasm_files(project_root);
-    wasm_files.sort();
-    wasm_files.dedup();
-    if let Some(stamp) = stamp_from_files(project_root, &wasm_files, None) {
-        return stamp;
-    }
+    let mut compiled_files = collect_frontend_compiled_files(project_root);
+    compiled_files.sort();
+    compiled_files.dedup();
 
-    // No FE wasm artifact was found (SSR-only build). Show a deterministic FE stamp
-    // based on frontend source assets rather than "unknown".
     let mut src_files = collect_frontend_source_files(project_root);
     src_files.sort();
     src_files.dedup();
-    if let Some(stamp) = stamp_from_files(project_root, &src_files, Some("ssr-")) {
+
+    let mut stamp_files = compiled_files.clone();
+    stamp_files.extend(src_files.iter().cloned());
+    stamp_files.sort();
+    stamp_files.dedup();
+
+    let hash_prefix = if compiled_files.is_empty() {
+        Some("ssr-")
+    } else {
+        None
+    };
+
+    if let Some(stamp) = stamp_from_files(project_root, &stamp_files, hash_prefix) {
         return stamp;
     }
 
@@ -129,7 +137,7 @@ fn is_human_tz_abbrev(value: &str) -> bool {
     !trimmed.is_empty() && trimmed.len() <= 6 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic())
 }
 
-fn collect_frontend_wasm_files(project_root: &Path) -> Vec<PathBuf> {
+fn collect_frontend_compiled_files(project_root: &Path) -> Vec<PathBuf> {
     let candidates = [
         project_root.join("target/site/pkg"),
         project_root.join("target/site"),
@@ -147,12 +155,7 @@ fn collect_frontend_wasm_files(project_root: &Path) -> Vec<PathBuf> {
         }
 
         if candidate.is_file() {
-            if candidate
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("wasm"))
-                .unwrap_or(false)
-            {
+            if is_frontend_compiled_asset(candidate.as_path()) {
                 files.push(candidate);
             }
             continue;
@@ -163,19 +166,24 @@ fn collect_frontend_wasm_files(project_root: &Path) -> Vec<PathBuf> {
                 .into_iter()
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_type().is_file())
-                .filter(|entry| {
-                    entry
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.eq_ignore_ascii_case("wasm"))
-                        .unwrap_or(false)
-                })
+                .filter(|entry| is_frontend_compiled_asset(entry.path()))
                 .map(|entry| entry.path().to_path_buf()),
         );
     }
 
     files
+}
+
+fn is_frontend_compiled_asset(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "wasm" | "js" | "mjs" | "css" | "html" | "map" | "json"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn collect_frontend_source_files(project_root: &Path) -> Vec<PathBuf> {

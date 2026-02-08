@@ -48,6 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/browser", get(browser_page))
         .route("/jobs", get(jobs_page))
         .route("/jobs/{job_id}", get(job_detail_page))
+        .route(
+            "/jobs/{job_id}/artifacts/{kind}/{index}",
+            get(download_job_artifact),
+        )
         .route("/jobs/submit", post(submit_job_form))
         .route("/jobs/{job_id}/cancel", post(cancel_job_form))
         .route("/jobs/{job_id}/requeue", post(requeue_job_form))
@@ -452,6 +456,71 @@ async fn job_detail_page(
     Ok(Html(page).into_response())
 }
 
+async fn download_job_artifact(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path((job_id, kind, index)): Path<(String, String, usize)>,
+) -> Result<Response, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Ok(Redirect::to("/login").into_response());
+    }
+
+    let Some(job) = state.db.get_job(&job_id).await? else {
+        return Err(ApiError::not_found("job not found"));
+    };
+
+    let stored_path = match kind.as_str() {
+        "downloaded" => job.downloaded_files.get(index),
+        "final" => job.final_paths.get(index),
+        _ => None,
+    }
+    .ok_or_else(|| ApiError::not_found("artifact not found"))?;
+
+    if stored_path.starts_with("torrent:") {
+        return Err(ApiError::bad_request(
+            "torrent artifacts are not downloadable files",
+        ));
+    }
+
+    let artifact_path = std::path::PathBuf::from(stored_path);
+    let resolved = if artifact_path.is_absolute() {
+        artifact_path
+    } else {
+        std::env::current_dir()
+            .map_err(ApiError::internal)?
+            .join(artifact_path)
+    };
+
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|_| ApiError::not_found("artifact file missing"))?;
+    if !metadata.is_file() {
+        return Err(ApiError::not_found("artifact is not a file"));
+    }
+
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(ApiError::internal)?;
+    let filename = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact.bin")
+        .replace(['"', '\\'], "_");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::header::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .map_err(ApiError::internal)?,
+    );
+
+    Ok((headers, bytes).into_response())
+}
+
 async fn submit_job_form(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
@@ -568,14 +637,15 @@ async fn requeue_job_form(
 async fn api_status(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let (is_running, current_task, downloads, message_count) =
         state.runtime.snapshot_status().await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     Ok(Json(json!({
         "is_running": is_running,
         "task": current_task,
         "downloads": downloads,
         "message_count": message_count,
         "git": {
-            "backend": state.git_info.backend.clone(),
-            "frontend": state.git_info.frontend.clone(),
+            "backend": git_info.backend,
+            "frontend": git_info.frontend,
         },
     })))
 }

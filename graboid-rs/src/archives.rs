@@ -11,6 +11,7 @@ use tokio::task;
 use walkdir::WalkDir;
 use xz2::read::XzDecoder;
 use zip::read::ZipArchive;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 pub fn is_archive(path: &Path) -> bool {
     let name = path
@@ -26,6 +27,12 @@ pub fn is_archive(path: &Path) -> bool {
         || name.ends_with(".tbz2")
         || name.ends_with(".tar.xz")
         || name.ends_with(".txz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tzst")
+        || name.ends_with(".gz")
+        || name.ends_with(".bz2")
+        || name.ends_with(".xz")
+        || name.ends_with(".zst")
         || name.ends_with(".7z")
         || name.ends_with(".rar")
 }
@@ -72,8 +79,17 @@ fn extract_archive_sync(
         || name.ends_with(".tbz2")
         || name.ends_with(".tar.xz")
         || name.ends_with(".txz")
+        || name.ends_with(".tar.zst")
+        || name.ends_with(".tzst")
     {
         return extract_tar(archive_path, output_dir, matcher.as_ref());
+    }
+    if name.ends_with(".zst")
+        || name.ends_with(".gz")
+        || name.ends_with(".bz2")
+        || name.ends_with(".xz")
+    {
+        return extract_single_compressed(archive_path, output_dir, matcher.as_ref());
     }
     if name.ends_with(".7z") || name.ends_with(".rar") {
         return extract_with_external_tool(archive_path, output_dir, matcher.as_ref());
@@ -148,10 +164,83 @@ fn extract_tar(
         let decoder = XzDecoder::new(file);
         return extract_tar_stream(Archive::new(decoder), output_dir, matcher);
     }
+    if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
+        let decoder = ZstdDecoder::new(file).context("failed initializing zstd decoder")?;
+        return extract_tar_stream(Archive::new(decoder), output_dir, matcher);
+    }
 
     let file = File::open(archive_path)
         .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
     extract_tar_stream(Archive::new(file), output_dir, matcher)
+}
+
+fn extract_single_compressed(
+    archive_path: &Path,
+    output_dir: &Path,
+    matcher: Option<&GlobSet>,
+) -> Result<Vec<PathBuf>> {
+    let name = archive_path
+        .file_name()
+        .map(|v| v.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if name.ends_with(".zst") {
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
+        let decoder = ZstdDecoder::new(file).context("failed initializing zstd decoder")?;
+        return extract_single_compressed_stream(decoder, archive_path, output_dir, matcher);
+    }
+    if name.ends_with(".gz") {
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
+        let decoder = GzDecoder::new(file);
+        return extract_single_compressed_stream(decoder, archive_path, output_dir, matcher);
+    }
+    if name.ends_with(".bz2") {
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
+        let decoder = BzDecoder::new(file);
+        return extract_single_compressed_stream(decoder, archive_path, output_dir, matcher);
+    }
+    if name.ends_with(".xz") {
+        let file = File::open(archive_path)
+            .with_context(|| format!("failed opening archive {}", archive_path.display()))?;
+        let decoder = XzDecoder::new(file);
+        return extract_single_compressed_stream(decoder, archive_path, output_dir, matcher);
+    }
+
+    bail!(
+        "unsupported single-file compressed format: {}",
+        archive_path.display()
+    )
+}
+
+fn extract_single_compressed_stream<R: io::Read>(
+    mut decoder: R,
+    archive_path: &Path,
+    output_dir: &Path,
+    matcher: Option<&GlobSet>,
+) -> Result<Vec<PathBuf>> {
+    let output_name = strip_single_compression_suffix(archive_path);
+    let rel_path = PathBuf::from(output_name);
+    if !matches_filter(&rel_path, matcher) {
+        return Ok(Vec::new());
+    }
+
+    let dest = output_dir.join(&rel_path);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+
+    let mut out =
+        File::create(&dest).with_context(|| format!("failed creating {}", dest.display()))?;
+    io::copy(&mut decoder, &mut out)
+        .with_context(|| format!("failed extracting {}", rel_path.display()))?;
+
+    Ok(vec![dest])
 }
 
 fn extract_tar_stream<R: io::Read>(
@@ -331,7 +420,8 @@ fn strip_archive_suffix(path: &Path) -> String {
     let lower = name.to_ascii_lowercase();
 
     for suffix in [
-        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar", ".zip", ".7z", ".rar",
+        ".tar.zst", ".tzst", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar",
+        ".zip", ".7z", ".rar", ".zst", ".gz", ".bz2", ".xz",
     ] {
         if lower.ends_with(suffix) {
             let keep = name.len().saturating_sub(suffix.len());
@@ -348,4 +438,24 @@ fn strip_archive_suffix(path: &Path) -> String {
         .map(|v| v.to_string_lossy().to_string())
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "extracted".to_string())
+}
+
+fn strip_single_compression_suffix(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|v| v.to_string_lossy().to_string())
+        .unwrap_or_else(|| "extracted".to_string());
+    let lower = name.to_ascii_lowercase();
+    for suffix in [".zst", ".gz", ".bz2", ".xz"] {
+        if lower.ends_with(suffix) {
+            let keep = name.len().saturating_sub(suffix.len());
+            let trimmed = name[..keep].trim().to_string();
+            return if trimmed.is_empty() {
+                "extracted".to_string()
+            } else {
+                trimmed
+            };
+        }
+    }
+    name
 }

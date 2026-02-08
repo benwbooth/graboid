@@ -208,6 +208,12 @@ impl JobDb {
             .await
             .context("failed creating idx_notes_domain")?;
 
+        // Older revisions initialized note use_count at 0. Treat first observation as one use.
+        sqlx::query("UPDATE notes SET use_count = 1 WHERE use_count < 1")
+            .execute(&self.pool)
+            .await
+            .context("failed normalizing note use_count")?;
+
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_credentials_updated ON credentials(updated_at DESC)",
         )
@@ -599,15 +605,68 @@ impl JobDb {
         success: Option<bool>,
     ) -> Result<NoteEntry> {
         let timestamp = Utc::now();
+        let success_i64 = success.map(|v| if v { 1_i64 } else { 0_i64 });
+
+        let existing = sqlx::query(
+            "SELECT id FROM notes WHERE domain = ? AND note_type = ? AND content = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(domain)
+        .bind(note_type)
+        .bind(content)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed loading existing note")?;
+
+        if let Some(existing_row) = existing {
+            let note_id: i64 = existing_row.try_get("id")?;
+
+            sqlx::query(
+                r#"
+                UPDATE notes
+                SET
+                    label = COALESCE(?, label),
+                    url_pattern = COALESCE(?, url_pattern),
+                    success = CASE
+                        WHEN ? IS NULL THEN success
+                        WHEN ? = 1 THEN 1
+                        ELSE COALESCE(success, 0)
+                    END,
+                    use_count = CASE
+                        WHEN use_count < 1 THEN 2
+                        ELSE use_count + 1
+                    END
+                WHERE id = ?
+                "#,
+            )
+            .bind(label)
+            .bind(url_pattern)
+            .bind(success_i64)
+            .bind(success_i64)
+            .bind(note_id)
+            .execute(&self.pool)
+            .await
+            .context("failed updating existing note")?;
+
+            let row = sqlx::query(
+                "SELECT id, domain, note_type, content, label, url_pattern, success, use_count, created_at FROM notes WHERE id = ?",
+            )
+            .bind(note_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("failed reloading updated note")?;
+
+            return row_to_note(row);
+        }
+
         let result = sqlx::query(
-            "INSERT INTO notes (domain, note_type, content, label, url_pattern, success, use_count, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            "INSERT INTO notes (domain, note_type, content, label, url_pattern, success, use_count, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
         )
         .bind(domain)
         .bind(note_type)
         .bind(content)
         .bind(label)
         .bind(url_pattern)
-        .bind(success.map(|v| if v { 1 } else { 0 }))
+        .bind(success_i64)
         .bind(timestamp.to_rfc3339())
         .execute(&self.pool)
         .await
@@ -621,7 +680,7 @@ impl JobDb {
             label: label.map(str::to_string),
             url_pattern: url_pattern.map(str::to_string),
             success,
-            use_count: 0,
+            use_count: 1,
             created_at: timestamp,
         })
     }
@@ -657,6 +716,41 @@ impl JobDb {
 
         rows.into_iter()
             .map(|r| r.try_get::<String, _>("domain").context("missing domain"))
+            .collect()
+    }
+
+    pub async fn preferred_source_domains(&self, limit: usize) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                domain,
+                COALESCE(SUM(CASE WHEN success = 1 THEN use_count ELSE 0 END), 0) AS success_weight,
+                COALESCE(SUM(CASE WHEN success = 0 THEN use_count ELSE 0 END), 0) AS failure_weight,
+                COUNT(*) AS note_count
+            FROM notes
+            WHERE note_type = 'source_quality'
+            GROUP BY domain
+            HAVING COALESCE(SUM(CASE WHEN success = 1 THEN use_count ELSE 0 END), 0) > 0
+            ORDER BY
+                (COALESCE(SUM(CASE WHEN success = 1 THEN use_count ELSE 0 END), 0)
+                 - COALESCE(SUM(CASE WHEN success = 0 THEN use_count ELSE 0 END), 0) * 2) DESC,
+                COALESCE(SUM(CASE WHEN success = 1 THEN use_count ELSE 0 END), 0) DESC,
+                COALESCE(SUM(CASE WHEN success = 0 THEN use_count ELSE 0 END), 0) ASC,
+                COUNT(*) DESC,
+                domain ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed listing preferred source domains")?;
+
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("domain")
+                    .context("missing preferred source domain")
+            })
             .collect()
     }
 

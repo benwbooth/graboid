@@ -1,104 +1,114 @@
-        :root {
-            --bg: #1a1a2e;
-            --bg-light: #16213e;
-            --bg-card: #0f3460;
-            --accent: #e94560;
-            --accent-light: #ff6b6b;
-            --text: #eee;
-            --text-dim: #aaa;
-            --error: #ef4444;
-        }
+:root {
+    --bg: #070f1c;
+    --bg-card: #111f35;
+    --border: #253b5a;
+    --accent: #4aa3ff;
+    --accent-light: #74b8ff;
+    --text: #e8eef8;
+    --text-dim: #9caeca;
+    --error: #ff8c8c;
+    --font-sans: "IBM Plex Sans", "Source Sans 3", "Avenir Next", "Trebuchet MS", sans-serif;
+}
 
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+* {
+    box-sizing: border-box;
+}
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
+body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-sans);
+    color: var(--text);
+    background:
+        radial-gradient(circle at 0% 0%, rgba(74, 163, 255, 0.15), transparent 40%),
+        radial-gradient(circle at 100% 0%, rgba(116, 184, 255, 0.12), transparent 35%),
+        var(--bg);
+}
 
-        .login-container {
-            background: var(--bg-card);
-            padding: 2.5rem;
-            border-radius: 0.5rem;
-            width: 100%;
-            max-width: 400px;
-            margin: 1rem;
-        }
+.login-container {
+    width: min(430px, calc(100vw - 2rem));
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 14px 30px rgba(0, 0, 0, 0.35);
+    padding: 2rem 1.8rem;
+}
 
-        .logo {
-            text-align: center;
-            margin-bottom: 2rem;
-        }
+.logo {
+    text-align: center;
+    margin-bottom: 1.55rem;
+}
 
-        .logo h1 {
-            font-size: 2rem;
-            color: var(--accent);
-            margin-bottom: 0.5rem;
-        }
+.logo h1 {
+    margin: 0 0 0.35rem;
+    font-size: 1.85rem;
+    color: #b9d9ff;
+    letter-spacing: 0.01em;
+}
 
-        .logo p {
-            color: var(--text-dim);
-            font-size: 0.875rem;
-        }
+.logo p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 0.88rem;
+}
 
-        .error {
-            background: rgba(239, 68, 68, 0.2);
-            border: 1px solid var(--error);
-            color: var(--error);
-            padding: 0.75rem;
-            border-radius: 0.25rem;
-            margin-bottom: 1.5rem;
-            font-size: 0.875rem;
-        }
+.error {
+    background: rgba(255, 140, 140, 0.16);
+    border: 1px solid #7a3e3e;
+    color: var(--error);
+    border-radius: 10px;
+    padding: 0.68rem 0.8rem;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+}
 
-        .form-group {
-            margin-bottom: 1.25rem;
-        }
+.form-group {
+    margin-bottom: 1rem;
+}
 
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            color: var(--text-dim);
-            font-size: 0.875rem;
-        }
+label {
+    display: block;
+    margin-bottom: 0.38rem;
+    color: #b2c4df;
+    font-size: 0.84rem;
+    font-weight: 600;
+}
 
-        input {
-            width: 100%;
-            padding: 0.75rem;
-            border: 1px solid var(--bg-light);
-            border-radius: 0.25rem;
-            background: var(--bg);
-            color: var(--text);
-            font-size: 1rem;
-        }
+input {
+    width: 100%;
+    border: 1px solid #304c71;
+    border-radius: 9px;
+    padding: 0.7rem 0.75rem;
+    font-size: 0.95rem;
+    font-family: inherit;
+    color: var(--text);
+    background: #0d1a2d;
+}
 
-        input:focus {
-            outline: none;
-            border-color: var(--accent);
-        }
+input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(74, 163, 255, 0.22);
+}
 
-        button {
-            width: 100%;
-            padding: 0.875rem;
-            border: none;
-            border-radius: 0.25rem;
-            background: var(--accent);
-            color: white;
-            font-size: 1rem;
-            font-weight: 500;
-            cursor: pointer;
-            transition: background 0.2s;
-        }
+button {
+    width: 100%;
+    border: none;
+    border-radius: 9px;
+    background: var(--accent);
+    color: #041227;
+    padding: 0.72rem;
+    margin-top: 0.3rem;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.16s ease, background-color 0.16s ease;
+}
 
-        button:hover {
-            background: var(--accent-light);
-        }
+button:hover {
+    background: var(--accent-light);
+    transform: translateY(-1px);
+}

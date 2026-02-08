@@ -71,7 +71,8 @@ impl BrowserBackend {
 
 const CHROME_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAUDE_STARTUP_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
-const CLAUDE_IDLE_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const CLAUDE_IDLE_SILENCE_TIMEOUT: Duration = Duration::from_secs(75);
+const CLAUDE_POST_DISCOVERY_IDLE_FINISH_TIMEOUT: Duration = Duration::from_secs(20);
 const CLAUDE_WAITING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const CLAUDE_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(20);
 
@@ -79,6 +80,9 @@ pub async fn run_navigation(
     job_id: &str,
     source_url: &str,
     prompt: &str,
+    file_filter: &[String],
+    destination_path: &str,
+    file_operation: &str,
     credential: Option<(String, String)>,
     cfg: &AppConfig,
     nav_tx: mpsc::UnboundedSender<NavEvent>,
@@ -98,6 +102,9 @@ pub async fn run_navigation(
             job_id,
             source_url,
             prompt,
+            file_filter,
+            destination_path,
+            file_operation,
             credential.clone(),
             cfg,
             nav_tx.clone(),
@@ -122,6 +129,9 @@ pub async fn run_navigation(
         job_id,
         source_url,
         prompt,
+        file_filter,
+        destination_path,
+        file_operation,
         credential,
         cfg,
         nav_tx,
@@ -134,6 +144,9 @@ async fn run_navigation_with_backend(
     job_id: &str,
     source_url: &str,
     prompt: &str,
+    file_filter: &[String],
+    destination_path: &str,
+    file_operation: &str,
     credential: Option<(String, String)>,
     cfg: &AppConfig,
     nav_tx: mpsc::UnboundedSender<NavEvent>,
@@ -177,7 +190,11 @@ async fn run_navigation_with_backend(
     let full_prompt = build_prompt(
         source_url,
         prompt,
+        file_filter,
+        destination_path,
+        file_operation,
         &download_dir,
+        cfg,
         backend,
         credential
             .as_ref()
@@ -342,6 +359,7 @@ async fn run_claude_session(
     let mut stream_connected = false;
     let mut startup_waited = 0_u64;
     let mut last_output_at = Instant::now();
+    let mut discovered_url_count = 0usize;
 
     let timeout = tokio::time::sleep(Duration::from_secs(cfg.claude_timeout_seconds));
     tokio::pin!(timeout);
@@ -390,6 +408,21 @@ async fn run_claude_session(
                 let idle_secs = Instant::now()
                     .saturating_duration_since(last_output_at)
                     .as_secs();
+                if discovered_url_count > 0
+                    && idle_secs >= CLAUDE_POST_DISCOVERY_IDLE_FINISH_TIMEOUT.as_secs()
+                {
+                    let _ = nav_tx.send(NavEvent::Log {
+                        level: "INFO".to_string(),
+                        source: "claude".to_string(),
+                        message: format!(
+                            "No new Claude output for {idle_secs}s after finding {discovered_url_count} URL(s); ending browse attempt"
+                        ),
+                    });
+                    let _ = proc.kill().await;
+                    let _ = tokio::time::timeout(Duration::from_secs(5), proc.wait()).await;
+                    return Ok(raw_output);
+                }
+
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "INFO".to_string(),
                     source: "claude".to_string(),
@@ -425,14 +458,15 @@ async fn run_claude_session(
             maybe_line = line_rx.recv() => {
                 match maybe_line {
                     Some(line) => {
-                        let reached_stream = handle_claude_line(
+                        let line_result = handle_claude_line(
                             &line,
                             &mut raw_output,
                             &mut step_counter,
                             nav_tx,
                         );
+                        discovered_url_count += line_result.found_urls;
 
-                        if reached_stream && !stream_connected {
+                        if line_result.stream_connected && !stream_connected {
                             stream_connected = true;
                             last_output_at = Instant::now();
                             let _ = nav_tx.send(NavEvent::Progress {
@@ -483,21 +517,21 @@ fn handle_claude_line(
     raw_output: &mut String,
     step_counter: &mut i64,
     nav_tx: &mpsc::UnboundedSender<NavEvent>,
-) -> bool {
+) -> ClaudeLineResult {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return false;
+        return ClaudeLineResult::default();
     }
 
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        let mut stream_connected = false;
+        let mut result = ClaudeLineResult::default();
         match value
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
             "system" => {
-                stream_connected = true;
+                result.stream_connected = true;
                 let _ = nav_tx.send(NavEvent::Log {
                     level: "INFO".to_string(),
                     source: "claude".to_string(),
@@ -505,7 +539,7 @@ fn handle_claude_line(
                 });
             }
             "assistant" => {
-                stream_connected = true;
+                result.stream_connected = true;
                 if let Some(content) = value
                     .get("message")
                     .and_then(|v| v.get("content"))
@@ -535,7 +569,9 @@ fn handle_claude_line(
                             }
                             "text" => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                    for url in parse_download_links(text) {
+                                    let links = parse_download_links(text);
+                                    result.found_urls += links.len();
+                                    for url in links {
                                         let _ = nav_tx.send(NavEvent::FoundUrl { url });
                                     }
                                     raw_output.push_str(text);
@@ -560,18 +596,20 @@ fn handle_claude_line(
                 }
             }
             "result" => {
-                stream_connected = true;
-                if let Some(result) = value.get("result").and_then(Value::as_str) {
-                    for url in parse_download_links(result) {
+                result.stream_connected = true;
+                if let Some(result_text) = value.get("result").and_then(Value::as_str) {
+                    let links = parse_download_links(result_text);
+                    result.found_urls += links.len();
+                    for url in links {
                         let _ = nav_tx.send(NavEvent::FoundUrl { url });
                     }
-                    raw_output.push_str(result);
+                    raw_output.push_str(result_text);
                     raw_output.push('\n');
                 }
             }
             _ => {}
         }
-        return stream_connected;
+        return result;
     }
 
     debug!("non-json claude line: {trimmed}");
@@ -582,7 +620,13 @@ fn handle_claude_line(
         source: "claude_raw".to_string(),
         message: truncate(trimmed, 220),
     });
-    false
+    ClaudeLineResult::default()
+}
+
+#[derive(Default)]
+struct ClaudeLineResult {
+    stream_connected: bool,
+    found_urls: usize,
 }
 
 fn spawn_output_reader<R>(stream: R, tx: mpsc::UnboundedSender<String>, stream_name: &'static str)
@@ -724,7 +768,11 @@ fn truncate(input: &str, max: usize) -> String {
 fn build_prompt(
     source_url: &str,
     prompt: &str,
+    file_filter: &[String],
+    destination_path: &str,
+    file_operation: &str,
     download_dir: &Path,
+    cfg: &AppConfig,
     backend: BrowserBackend,
     credential: Option<(&str, &str)>,
 ) -> String {
@@ -758,17 +806,66 @@ fn build_prompt(
         BrowserBackend::ChromeDevtools => "Use chrome-devtools MCP tools for navigation.",
         BrowserBackend::BrowserUse => "Use browser-use MCP tools for navigation.",
     };
+    let file_filter_summary = if file_filter.is_empty() {
+        "none".to_string()
+    } else {
+        file_filter
+            .iter()
+            .take(8)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let selective_torrent_status = if matches!(cfg.torrent_client.as_str(), "embedded" | "auto") {
+        if cfg!(feature = "librqbit-embedded") {
+            if file_filter.is_empty() {
+                "available (emit [FILE_FILTER] PATTERN lines to activate selective matching)"
+            } else {
+                "enabled (active file filters will be used)"
+            }
+        } else {
+            "configured but unavailable in this build (missing feature `librqbit-embedded`)"
+        }
+    } else {
+        "disabled by torrent_client setting (non-embedded backend)"
+    };
+    let file_filter_requirement = if file_filter.is_empty() {
+        "If you can infer target filenames, emit one or more `[FILE_FILTER] PATTERN: <glob>` lines before finishing (example: `[FILE_FILTER] PATTERN: *invoice*.*`)."
+    } else {
+        "Respect active file filters and prioritize links likely to match them."
+    };
 
     format!(
         "{} {}\n\n\
          {}\
          Navigate to {} and complete this task:\n{}\n\n\
+         JOB CONTEXT:\n\
+         - destination_path: {}\n\
+         - file_operation: {}\n\
+         - file_filter: {}\n\
+         - torrent_client: {}\n\
+         - selective_torrent: {}\n\
+         - archive_extractors: zip, 7z, rar, tar, tar.gz, tar.bz2, tar.xz, tar.zst/tzst, gz, bz2, xz, zst\n\n\
+         BACKEND TOOLCHAIN (triggered by your outputs):\n\
+         - Emit `[DOWNLOAD] URL: <url>` for direct files, magnet links, or `.torrent` links.\n\
+         - Backend will download, extract archives, filter files, and place final outputs automatically.\n\
+         - Use strong judgment: prefer the most relevant, authoritative, complete, and user-intent-aligned result(s).\n\
+         - After surveying relevant options on the current page, emit a curated set of best candidates (usually 1-5).\n\n\
          REQUIREMENTS:\n\
          - {} \n\
          - Use targeted page search with evaluate_script (querySelectorAll on links/buttons) before broad snapshots.\n\
+         - On long directory pages, do one evaluate_script pass that extracts all anchor href/text pairs and filter in-script by task keywords.\n\
+         - Do not loop between homepage and the same directory. Stay in the deepest relevant page until links are extracted.\n\
+         - Never navigate to about:blank again after the first real page load unless recovery is required.\n\
          - Avoid repeated identical tool calls; if one approach fails, switch strategy immediately.\n\
          - When you find a downloadable link, emit: [DOWNLOAD] URL: <url>\n\
-         - Once at least one viable download URL is found, stop exploring and finish unless the user explicitly requested exhaustive source comparison.\n\
+         - {}\n\
+         - When multiple plausible options exist, choose a small curated set using common-sense quality checks and user intent.\n\
+         - Avoid low-value or ambiguous variants unless no better candidate exists.\n\
+         - Do not stop at the first plausible link; quickly compare nearby alternatives on the same page before deciding.\n\
+         - Emit learning notes when useful: [LEARNING: type=navigation_tip] <tip> or [LEARNING: type=download_method] <tip>\n\
          - Emit clear progress while navigating.\n\
          - End with [RESULT] SUCCESS: true/false\n\
          - If blocked, emit: [ERROR] PROBLEM: <description>\n\n\
@@ -778,7 +875,13 @@ fn build_prompt(
         credential_block,
         target,
         prompt,
+        destination_path,
+        file_operation,
+        file_filter_summary,
+        cfg.torrent_client,
+        selective_torrent_status,
         backend_requirement,
+        file_filter_requirement,
         target
     )
 }

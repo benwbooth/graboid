@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         runner,
         events: events_tx,
         runtime,
+        project_root: project_root.clone(),
         git_info,
         auth: AuthConfig {
             username: config.username.clone(),
