@@ -13,7 +13,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use which::which;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, NamedSource};
 
 #[derive(Debug, Clone)]
 pub enum NavEvent {
@@ -806,6 +806,7 @@ fn build_prompt(
         BrowserBackend::ChromeDevtools => "Use chrome-devtools MCP tools for navigation.",
         BrowserBackend::BrowserUse => "Use browser-use MCP tools for navigation.",
     };
+    let named_source_catalog = render_named_source_catalog(&cfg.named_sources());
     let file_filter_summary = if file_filter.is_empty() {
         "none".to_string()
     } else {
@@ -848,6 +849,7 @@ fn build_prompt(
          - torrent_client: {}\n\
          - selective_torrent: {}\n\
          - archive_extractors: zip, 7z, rar, tar, tar.gz, tar.bz2, tar.xz, tar.zst/tzst, gz, bz2, xz, zst\n\n\
+         {}\
          BACKEND TOOLCHAIN (triggered by your outputs):\n\
          - Emit `[DOWNLOAD] URL: <url>` for direct files, magnet links, or `.torrent` links.\n\
          - Backend will download, extract archives, filter files, and place final outputs automatically.\n\
@@ -865,6 +867,7 @@ fn build_prompt(
          - When multiple plausible options exist, choose a small curated set using common-sense quality checks and user intent.\n\
          - Avoid low-value or ambiguous variants unless no better candidate exists.\n\
          - Do not stop at the first plausible link; quickly compare nearby alternatives on the same page before deciding.\n\
+         - If you use a configured named source, emit `[SOURCE] NAME: <name>` once when selecting it.\n\
          - Emit learning notes when useful: [LEARNING: type=navigation_tip] <tip> or [LEARNING: type=download_method] <tip>\n\
          - Emit clear progress while navigating.\n\
          - End with [RESULT] SUCCESS: true/false\n\
@@ -880,9 +883,49 @@ fn build_prompt(
         file_filter_summary,
         cfg.torrent_client,
         selective_torrent_status,
+        named_source_catalog,
         backend_requirement,
         file_filter_requirement,
         target
+    )
+}
+
+fn render_named_source_catalog(named_sources: &[NamedSource]) -> String {
+    if named_sources.is_empty() {
+        return "NAMED REMOTE SOURCES:\n- none configured\n\n".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for source in named_sources.iter().take(24) {
+        let endpoint = if let Some(port) = source.port {
+            format!("{}:{port}", source.host)
+        } else {
+            source.host.clone()
+        };
+        let location = if source.location.trim().is_empty() {
+            "-".to_string()
+        } else {
+            source.location.clone()
+        };
+        let username = if source.username.trim().is_empty() {
+            "-".to_string()
+        } else {
+            source.username.clone()
+        };
+        let auth = if source.password.trim().is_empty() {
+            "password=none"
+        } else {
+            "password=configured"
+        };
+        lines.push(format!(
+            "- {} | {} | endpoint={} | location={} | user={} | {}",
+            source.name, source.kind, endpoint, location, username, auth
+        ));
+    }
+
+    format!(
+        "NAMED REMOTE SOURCES (prefer these before broad web search when relevant):\n{}\n\n",
+        lines.join("\n")
     )
 }
 

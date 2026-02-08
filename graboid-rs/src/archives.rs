@@ -426,16 +426,18 @@ fn strip_archive_suffix(path: &Path) -> String {
         if lower.ends_with(suffix) {
             let keep = name.len().saturating_sub(suffix.len());
             let trimmed = name[..keep].trim().to_string();
-            return if trimmed.is_empty() {
+            let decoded = sanitize_output_name(&decode_percent_escapes(&trimmed));
+            return if decoded.is_empty() {
                 "extracted".to_string()
             } else {
-                trimmed
+                decoded
             };
         }
     }
 
     path.file_stem()
         .map(|v| v.to_string_lossy().to_string())
+        .map(|v| sanitize_output_name(&decode_percent_escapes(&v)))
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "extracted".to_string())
 }
@@ -450,12 +452,89 @@ fn strip_single_compression_suffix(path: &Path) -> String {
         if lower.ends_with(suffix) {
             let keep = name.len().saturating_sub(suffix.len());
             let trimmed = name[..keep].trim().to_string();
-            return if trimmed.is_empty() {
+            let decoded = sanitize_output_name(&decode_percent_escapes(&trimmed));
+            return if decoded.is_empty() {
                 "extracted".to_string()
             } else {
-                trimmed
+                decoded
             };
         }
     }
-    name
+    sanitize_output_name(&decode_percent_escapes(&name))
+}
+
+fn sanitize_output_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => ch,
+        })
+        .collect()
+}
+
+fn decode_percent_escapes(input: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    let mut changed = false;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[idx + 1]), hex(bytes[idx + 2])) {
+                out.push((hi << 4) | lo);
+                idx += 3;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+
+    if !changed {
+        return input.to_string();
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{default_extract_dir, strip_archive_suffix, strip_single_compression_suffix};
+
+    #[test]
+    fn strip_archive_suffix_decodes_percent_escapes() {
+        assert_eq!(
+            strip_archive_suffix(Path::new("Internet%20Archive%20Pack.zip")),
+            "Internet Archive Pack"
+        );
+    }
+
+    #[test]
+    fn strip_single_suffix_decodes_percent_escapes() {
+        assert_eq!(
+            strip_single_compression_suffix(Path::new("Sample%20File.chd.zst")),
+            "Sample File.chd"
+        );
+    }
+
+    #[test]
+    fn default_extract_dir_uses_decoded_name() {
+        assert_eq!(
+            default_extract_dir(Path::new("/tmp/NES%20Complete%20Set.7z")),
+            PathBuf::from("/tmp/NES Complete Set")
+        );
+    }
 }

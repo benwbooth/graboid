@@ -4,6 +4,7 @@ use chrono::Utc;
 use leptos::*;
 use serde_json::Value;
 
+use crate::config::{NamedSource, encode_named_source_line, parse_named_source_line};
 use crate::models::{Job, JobLogEntry, JobStatus, JobStepDetail, NoteEntry, NoteStats};
 use crate::state::{AgentMessage, GitInfo};
 
@@ -331,18 +332,33 @@ fn render_job_detail_content(
 ) -> View {
     let status_class = job_status_class(job.status).to_string();
     let status_text = job.status.as_str().to_string();
-    let phase_text = job.current_phase.as_str().to_string();
-    let progress_text = if job.progress_message.trim().is_empty() {
-        format!("{:.0}%", job.progress_percent)
-    } else {
-        format!("{:.0}% {}", job.progress_percent, job.progress_message)
-    };
-    let source_url = if job.source_url.trim().is_empty() {
-        "-".to_string()
+    let activity_text = concise_job_activity(
+        job.status,
+        job.current_phase.as_str(),
+        job.progress_percent,
+        &job.progress_message,
+    );
+    let source_hint = if job.source_url.trim().is_empty() {
+        "Auto-discover (no source URL provided)".to_string()
     } else {
         job.source_url.clone()
     };
-    let metadata = serde_json::to_string_pretty(&job.metadata).unwrap_or_else(|_| "{}".to_string());
+    let priority_text = if job.priority == 0 {
+        "Normal (0)".to_string()
+    } else {
+        job.priority.to_string()
+    };
+    let metadata = if job.metadata.is_null()
+        || job
+            .metadata
+            .as_object()
+            .map(|map| map.is_empty())
+            .unwrap_or(false)
+    {
+        "(none)".to_string()
+    } else {
+        serde_json::to_string_pretty(&job.metadata).unwrap_or_else(|_| "{}".to_string())
+    };
     let total_steps = steps.len();
     let selected_step = request
         .query_params
@@ -434,19 +450,20 @@ fn render_job_detail_content(
         .into_view()
     };
 
-    let step_claude_items: Vec<View> = if let Some(step) = selected_step_detail {
+    let step_agent_items: Vec<View> = if let Some(step) = selected_step_detail {
         if step.claude_messages.is_empty() {
             vec![
-                view! { <p style="color: var(--text-dim);">"No Claude notes for this step."</p> }
+                view! { <p style="color: var(--text-dim);">"No agent output for this step."</p> }
                     .into_view(),
             ]
         } else {
             step.claude_messages
                 .iter()
+                .rev()
                 .map(|message| {
                     view! {
                         <div class="message">
-                            <div class="role">"Claude"</div>
+                            <div class="role">"Agent"</div>
                             <div class="content">{message.clone()}</div>
                         </div>
                     }
@@ -456,11 +473,14 @@ fn render_job_detail_content(
         }
     } else {
         vec![
-            view! { <p style="color: var(--text-dim);">"No Claude notes for this step."</p> }
+            view! { <p style="color: var(--text-dim);">"No agent output for this step."</p> }
                 .into_view(),
         ]
     };
 
+    let step_has_notes = selected_step_detail
+        .map(|step| !step.notes.is_empty())
+        .unwrap_or(false);
     let step_note_items: Vec<View> = if let Some(step) = selected_step_detail {
         if step.notes.is_empty() {
             vec![view! { <li style="color: var(--text-dim);">"No notes attached to this step."</li> }.into_view()]
@@ -476,13 +496,23 @@ fn render_job_detail_content(
                 .into_view(),
         ]
     };
+    let step_notes_style = if step_has_notes {
+        String::new()
+    } else {
+        "display: none;".to_string()
+    };
 
-    let logs_to_show = logs.iter().rev().take(80).collect::<Vec<_>>();
+    let logs_to_show = logs
+        .iter()
+        .filter(|log| !log.source.starts_with("claude"))
+        .rev()
+        .take(80)
+        .collect::<Vec<_>>();
     let log_rows: Vec<View> = if logs_to_show.is_empty() {
         vec![view! {
             <tr>
                 <td colspan="4" style="color: var(--text-dim); text-align: center; padding: 1rem;">
-                    "No logs yet"
+                    "No system logs yet"
                 </td>
             </tr>
         }
@@ -504,15 +534,24 @@ fn render_job_detail_content(
             .collect()
     };
 
-    let found_url_items = render_string_list(&job.found_urls, "No URLs found yet.");
-    let downloaded_file_items = render_artifact_list(
-        &job.id,
-        "downloaded",
-        &job.downloaded_files,
-        "No downloaded files yet.",
-    );
-    let final_path_items =
-        render_artifact_list(&job.id, "final", &job.final_paths, "No final paths yet.");
+    let found_url_items = render_string_list(&job.found_urls, "No candidate URLs found yet.");
+    let output_kind = if job.final_paths.is_empty() {
+        "downloaded"
+    } else {
+        "final"
+    };
+    let output_values = if job.final_paths.is_empty() {
+        &job.downloaded_files
+    } else {
+        &job.final_paths
+    };
+    let output_hint = if output_kind == "final" {
+        "Showing final files after extract/filter/copy."
+    } else {
+        "Showing direct downloads (no finalized outputs yet)."
+    };
+    let output_file_items =
+        render_artifact_list(&job.id, output_kind, output_values, "No output files yet.");
     let steps_bootstrap_json = serde_json::to_string(steps)
         .unwrap_or_else(|_| "[]".to_string())
         .replace("</", "<\\/");
@@ -540,8 +579,7 @@ fn render_job_detail_content(
                         >
                             {status_text.clone()}
                         </span>
-                        <span id="job-progress-text">{progress_text}</span>
-                        <span id="job-phase-text">{phase_text}</span>
+                        <span id="job-progress-text">{activity_text}</span>
                     </div>
                 </div>
 
@@ -589,10 +627,10 @@ fn render_job_detail_content(
                             />
                         </div>
 
-                        <h3 class="job-subtitle">"Claude"</h3>
-                        <div id="job-step-claude" class="messages job-step-messages">{step_claude_items}</div>
-                        <h3 class="job-subtitle">"Step Notes"</h3>
-                        <ul id="job-step-notes" class="job-step-notes">{step_note_items}</ul>
+                        <h3 class="job-subtitle">"Agent Output"</h3>
+                        <div id="job-step-agent" class="messages job-step-messages">{step_agent_items}</div>
+                        <h3 id="job-step-notes-title" class="job-subtitle" style=step_notes_style.clone()>"System Notes"</h3>
+                        <ul id="job-step-notes" class="job-step-notes" style=step_notes_style>{step_note_items}</ul>
                     </div>
 
                     <div class="job-detail-side">
@@ -602,10 +640,10 @@ fn render_job_detail_content(
                                 <tr><td style="color: var(--text-dim);">"Created"</td><td id="job-created-text">{created_relative}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Updated"</td><td id="job-updated-text">{updated_relative}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Ran for"</td><td id="job-duration-text">{job_duration}</td></tr>
-                                <tr><td style="color: var(--text-dim);">"Source"</td><td id="job-source-url-text">{source_url}</td></tr>
+                                <tr><td style="color: var(--text-dim);">"Source Hint"</td><td id="job-source-url-text">{source_hint}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Destination"</td><td id="job-destination-text">{job.destination_path.clone()}</td></tr>
                                 <tr><td style="color: var(--text-dim);">"Operation"</td><td id="job-operation-text">{job.file_operation.clone()}</td></tr>
-                                <tr><td style="color: var(--text-dim);">"Priority"</td><td id="job-priority-text">{job.priority.to_string()}</td></tr>
+                                <tr><td style="color: var(--text-dim);">"Queue Priority"</td><td id="job-priority-text">{priority_text}</td></tr>
                             </table>
                             <h3 class="job-subtitle">"Prompt"</h3>
                             <pre id="job-prompt-text" class="job-prompt">{job.prompt.clone()}</pre>
@@ -623,9 +661,12 @@ fn render_job_detail_content(
                         </div>
 
                         <details class="card" id="job-metadata-details">
-                            <summary>"Metadata + Filter"</summary>
+                            <summary>"Advanced Input"</summary>
+                            <p style="color: var(--text-dim); font-size: 0.8rem; margin-top: 0.6rem;">
+                                "Metadata is optional API context. File Filter narrows extracted output files."
+                            </p>
                             <pre id="job-metadata-text" style="max-height: 250px; overflow: auto; font-size: 0.8rem; margin-top: 0.75rem;">{metadata}</pre>
-                            <h3 class="job-subtitle">"File Filter"</h3>
+                            <h3 class="job-subtitle">"File Filter (optional)"</h3>
                             <pre id="job-file-filter-text" style="max-height: 120px; overflow: auto; font-size: 0.8rem;">{
                                 if job.file_filter.is_empty() {
                                     "(none)".to_string()
@@ -638,23 +679,27 @@ fn render_job_detail_content(
                 </div>
 
                 <details class="card" id="job-artifacts-details">
-                    <summary>"Artifacts"</summary>
+                    <summary>"Discovery + Outputs"</summary>
                     <div class="grid-2" style="margin-top: 0.75rem;">
                         <div>
-                            <h3 class="job-subtitle">"Found URLs"</h3>
+                            <h3 class="job-subtitle">"Candidate URLs"</h3>
                             <ul id="job-found-urls" class="job-list">{found_url_items}</ul>
                         </div>
                         <div>
-                            <h3 class="job-subtitle">"Downloaded Files"</h3>
-                            <ul id="job-downloaded-files" class="job-list">{downloaded_file_items}</ul>
+                            <h3 class="job-subtitle">"Output Files"</h3>
+                            <p id="job-output-files-help" style="color: var(--text-dim); font-size: 0.8rem; margin: 0 0 0.45rem;">
+                                {output_hint}
+                            </p>
+                            <ul id="job-output-files" class="job-list">{output_file_items}</ul>
                         </div>
                     </div>
-                    <h3 class="job-subtitle">"Final Paths"</h3>
-                    <ul id="job-final-paths" class="job-list">{final_path_items}</ul>
                 </details>
 
                 <details class="card" id="job-logs-details">
-                    <summary>"Recent Logs"</summary>
+                    <summary>"System Logs"</summary>
+                    <p style="color: var(--text-dim); font-size: 0.8rem; margin-top: 0.6rem;">
+                        "Runtime/runner logs from Graboid (agent chat output excluded)."
+                    </p>
                     <table style="margin-top: 0.75rem;">
                         <thead>
                             <tr>
@@ -933,6 +978,36 @@ fn format_elapsed_duration(seconds: i64) -> String {
         format!("{minutes}m {secs}s")
     } else {
         format!("{secs}s")
+    }
+}
+
+fn concise_job_activity(
+    status: JobStatus,
+    phase: &str,
+    progress_percent: f64,
+    progress_message: &str,
+) -> String {
+    let percent = format!("{:.0}%", progress_percent.round());
+    let message = progress_message.trim();
+    if status.is_terminal() {
+        let label = match status {
+            JobStatus::Complete => "Done",
+            JobStatus::Failed => "Failed",
+            JobStatus::Cancelled => "Cancelled",
+            _ => status.as_str(),
+        };
+        return format!("{percent} {label}");
+    }
+
+    if message.is_empty() {
+        let phase = phase.trim();
+        if phase.is_empty() {
+            format!("{percent} Working")
+        } else {
+            format!("{percent} {phase}...")
+        }
+    } else {
+        format!("{percent} {message}")
     }
 }
 
@@ -1255,9 +1330,157 @@ fn render_config_content(
     let llm_provider = cfg_string(config, "llm_provider", "claude_code");
     let llm_model = cfg_string(config, "llm_model", "sonnet");
 
-    let browser_mode = cfg_string(config, "browser_mode", "chrome");
-    let browser_use_mcp_command = cfg_string(config, "browser_use_mcp_command", "uvx");
-    let browser_use_mcp_args = cfg_string(config, "browser_use_mcp_args", "browser-use[mcp]");
+    let source_endpoints = cfg_source_endpoint_rows(config);
+    let source_endpoints_hidden = source_endpoints
+        .iter()
+        .filter(|source| {
+            !source.host.trim().is_empty()
+                || !source.name.trim().is_empty()
+                || !source.location.trim().is_empty()
+                || !source.username.trim().is_empty()
+                || !source.password.trim().is_empty()
+        })
+        .map(encode_named_source_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source_endpoint_rows: Vec<View> = source_endpoints
+        .iter()
+        .map(|source| {
+            let port_value = source.port.map(|port| port.to_string()).unwrap_or_default();
+            let kind = source.kind.clone();
+            view! {
+                <div class="source-endpoint-row" data-source-endpoint-row="1">
+                    <input
+                        type="text"
+                        class="source-endpoint-name"
+                        placeholder="source name"
+                        value=source.name.clone()
+                    />
+                    <select class="source-endpoint-kind">
+                        <option value="sftp" selected=kind=="sftp">"SFTP"</option>
+                        <option value="ftp" selected=kind=="ftp">"FTP"</option>
+                        <option value="samba" selected=kind=="samba">"Samba"</option>
+                    </select>
+                    <input
+                        type="text"
+                        class="source-endpoint-host"
+                        placeholder="host"
+                        value=source.host.clone()
+                    />
+                    <input
+                        type="number"
+                        class="source-endpoint-port"
+                        placeholder="port"
+                        value=port_value
+                    />
+                    <input
+                        type="text"
+                        class="source-endpoint-location"
+                        placeholder="path/share"
+                        value=source.location.clone()
+                    />
+                    <input
+                        type="text"
+                        class="source-endpoint-username"
+                        placeholder="username"
+                        value=source.username.clone()
+                    />
+                    <input
+                        type="password"
+                        class="source-endpoint-password"
+                        placeholder="password"
+                        value=source.password.clone()
+                    />
+                    <button type="button" class="secondary source-endpoint-remove">
+                        "Delete"
+                    </button>
+                </div>
+            }
+            .into_view()
+        })
+        .collect::<Vec<_>>();
+    let local_read_whitelist = cfg_string_lines(config, "local_read_whitelist");
+    let local_write_whitelist = cfg_string_lines(config, "local_write_whitelist");
+    let local_read_values = non_empty_lines(&local_read_whitelist);
+    let local_write_values = non_empty_lines(&local_write_whitelist);
+    let local_read_rows: Vec<View> = if local_read_values.is_empty() {
+        vec![
+            view! {
+                <div class="local-path-row" data-local-path-row="1">
+                    <input
+                        type="text"
+                        class="local-path-input local-read-path"
+                        data-dir-autocomplete="1"
+                        placeholder="/mnt/data"
+                    />
+                    <button type="button" class="secondary local-path-remove">
+                        "Delete"
+                    </button>
+                </div>
+            }
+            .into_view(),
+        ]
+    } else {
+        local_read_values
+            .iter()
+            .map(|path| {
+                view! {
+                    <div class="local-path-row" data-local-path-row="1">
+                        <input
+                            type="text"
+                            class="local-path-input local-read-path"
+                            data-dir-autocomplete="1"
+                            placeholder="/mnt/data"
+                            value=path.clone()
+                        />
+                        <button type="button" class="secondary local-path-remove">
+                            "Delete"
+                        </button>
+                    </div>
+                }
+                .into_view()
+            })
+            .collect::<Vec<_>>()
+    };
+    let local_write_rows: Vec<View> = if local_write_values.is_empty() {
+        vec![
+            view! {
+                <div class="local-path-row" data-local-path-row="1">
+                    <input
+                        type="text"
+                        class="local-path-input local-write-path"
+                        data-dir-autocomplete="1"
+                        placeholder="/mnt/downloads"
+                    />
+                    <button type="button" class="secondary local-path-remove">
+                        "Delete"
+                    </button>
+                </div>
+            }
+            .into_view(),
+        ]
+    } else {
+        local_write_values
+            .iter()
+            .map(|path| {
+                view! {
+                    <div class="local-path-row" data-local-path-row="1">
+                        <input
+                            type="text"
+                            class="local-path-input local-write-path"
+                            data-dir-autocomplete="1"
+                            placeholder="/mnt/downloads"
+                            value=path.clone()
+                        />
+                        <button type="button" class="secondary local-path-remove">
+                            "Delete"
+                        </button>
+                    </div>
+                }
+                .into_view()
+            })
+            .collect::<Vec<_>>()
+    };
 
     let headless = cfg_bool(config, "headless", true);
     let download_dir = cfg_string(config, "download_dir", "./downloads");
@@ -1265,15 +1488,139 @@ fn render_config_content(
     let download_retry_attempts = cfg_i64(config, "download_retry_attempts", 2);
     let download_retry_backoff_sec = cfg_f64(config, "download_retry_backoff_sec", 2.0);
     let download_max_parallel = cfg_i64(config, "download_max_parallel", 4);
-    let path_mappings = cfg_path_mappings(config);
+    let path_mapping_pairs = cfg_path_mapping_pairs(config);
+    let path_mappings = path_mapping_pairs
+        .iter()
+        .filter_map(|(source, dest)| {
+            let src = source.trim();
+            let dst = dest.trim();
+            if src.is_empty() && dst.is_empty() {
+                None
+            } else {
+                Some(format!("{src}:{dst}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path_mapping_rows: Vec<View> = if path_mapping_pairs.is_empty() {
+        vec![
+            view! {
+                <div class="path-map-row" data-path-map-row="1">
+                    <input
+                        type="text"
+                        class="path-map-source"
+                        data-map-source="1"
+                        data-dir-autocomplete="1"
+                        placeholder="/host/path"
+                    />
+                    <span class="path-map-arrow">"→"</span>
+                    <input
+                        type="text"
+                        class="path-map-dest"
+                        data-map-dest="1"
+                        data-dir-autocomplete="1"
+                        placeholder="/container/path"
+                    />
+                    <button type="button" class="secondary path-map-remove" data-path-map-remove="1">
+                        "Delete"
+                    </button>
+                </div>
+            }
+            .into_view(),
+        ]
+    } else {
+        path_mapping_pairs
+            .iter()
+            .map(|(source, dest)| {
+                view! {
+                    <div class="path-map-row" data-path-map-row="1">
+                        <input
+                            type="text"
+                            class="path-map-source"
+                            data-map-source="1"
+                            data-dir-autocomplete="1"
+                            placeholder="/host/path"
+                            value=source.clone()
+                        />
+                        <span class="path-map-arrow">"→"</span>
+                        <input
+                            type="text"
+                            class="path-map-dest"
+                            data-map-dest="1"
+                            data-dir-autocomplete="1"
+                            placeholder="/container/path"
+                            value=dest.clone()
+                        />
+                        <button type="button" class="secondary path-map-remove" data-path-map-remove="1">
+                            "Delete"
+                        </button>
+                    </div>
+                }
+                .into_view()
+            })
+            .collect::<Vec<_>>()
+    };
     let log_level = cfg_string(config, "log_level", "INFO");
-
+    let show_auto = if torrent_client == "auto" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_embedded = if torrent_client == "embedded" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_qbit = if torrent_client == "qbittorrent" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_transmission = if torrent_client == "transmission" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_deluge = if torrent_client == "deluge" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_rtorrent = if torrent_client == "rtorrent" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
+    let show_aria2 = if torrent_client == "aria2" {
+        "display: block;"
+    } else {
+        "display: none;"
+    };
     view! {
         <>
             <h1>"Configuration"</h1>
-            {saved.then(|| view! { <div class="alert success">"Configuration saved successfully."</div> })}
+            {saved.then(|| view! { <div class="alert success">"Configuration saved. Auto-save is now active."</div> })}
+            <div class="card" style="margin-bottom: 0.9rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.8rem; flex-wrap: wrap;">
+                    <div>
+                        <span style="color: var(--text-dim);">"Config file: "</span>
+                        <code>{config_path.to_string()}</code>
+                    </div>
+                    <span id="config-save-status" class="tag">"Auto-save enabled"</span>
+                </div>
+            </div>
 
-            <form method="post" action="/config">
+            <form method="post" action="/config" id="config-form">
+                <textarea name="path_mappings" id="path_mappings" style="display: none;">{path_mappings}</textarea>
+                <textarea name="source_endpoints" id="source_endpoints" style="display: none;">
+                    {source_endpoints_hidden}
+                </textarea>
+                <textarea name="local_read_whitelist" id="local_read_whitelist" style="display: none;">
+                    {local_read_whitelist}
+                </textarea>
+                <textarea name="local_write_whitelist" id="local_write_whitelist" style="display: none;">
+                    {local_write_whitelist}
+                </textarea>
                 <div class="grid-2">
                     <div class="card">
                         <h2>"Torrent Client"</h2>
@@ -1288,57 +1635,80 @@ fn render_config_content(
                             <option value="aria2" selected=torrent_client=="aria2">"aria2"</option>
                         </select>
 
-                        <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">"qBittorrent Settings"</h3>
-                        <label for="qbittorrent_host">"Host"</label>
-                        <input type="text" name="qbittorrent_host" id="qbittorrent_host" value=qb_host />
-                        <label for="qbittorrent_port">"Port"</label>
-                        <input type="number" name="qbittorrent_port" id="qbittorrent_port" value=qb_port.to_string() />
-                        <label for="qbittorrent_username">"Username"</label>
-                        <input type="text" name="qbittorrent_username" id="qbittorrent_username" value=qb_username />
-                        <label for="qbittorrent_password">"Password"</label>
-                        <input type="password" name="qbittorrent_password" id="qbittorrent_password" value=qb_password />
+                        <div class="config-inline-actions">
+                            <button type="button" class="secondary" id="test-torrent-client">
+                                "Test Torrent Client Connection"
+                            </button>
+                            <span id="torrent-test-result" class="config-inline-status">"Not tested"</span>
+                        </div>
 
-                        <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">"Transmission Settings"</h3>
-                        <label for="transmission_host">"Host"</label>
-                        <input type="text" name="transmission_host" id="transmission_host" value=transmission_host />
-                        <label for="transmission_port">"Port"</label>
-                        <input type="number" name="transmission_port" id="transmission_port" value=transmission_port.to_string() />
-                        <label for="transmission_username">"Username"</label>
-                        <input type="text" name="transmission_username" id="transmission_username" value=transmission_username />
-                        <label for="transmission_password">"Password"</label>
-                        <input type="password" name="transmission_password" id="transmission_password" value=transmission_password />
-
-                        <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">"Deluge Settings"</h3>
-                        <label for="deluge_host">"Host"</label>
-                        <input type="text" name="deluge_host" id="deluge_host" value=deluge_host />
-                        <label for="deluge_port">"Port"</label>
-                        <input type="number" name="deluge_port" id="deluge_port" value=deluge_port.to_string() />
-                        <label for="deluge_username">"Username"</label>
-                        <input type="text" name="deluge_username" id="deluge_username" value=deluge_username />
-                        <label for="deluge_password">"Password"</label>
-                        <input type="password" name="deluge_password" id="deluge_password" value=deluge_password />
-
-                        <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">"rTorrent Settings"</h3>
-                        <label for="rtorrent_url">"XML-RPC URL"</label>
-                        <input
-                            type="text"
-                            name="rtorrent_url"
-                            id="rtorrent_url"
-                            value=rtorrent_url
-                            placeholder="http://localhost:8000/RPC2"
-                        />
-
-                        <h3 style="margin: 1.5rem 0 1rem; font-size: 1rem;">"aria2 Settings"</h3>
-                        <label for="aria2_host">"Host"</label>
-                        <input type="text" name="aria2_host" id="aria2_host" value=aria2_host />
-                        <label for="aria2_port">"Port"</label>
-                        <input type="number" name="aria2_port" id="aria2_port" value=aria2_port.to_string() />
-                        <label for="aria2_secret">"Secret Token"</label>
-                        <input type="password" name="aria2_secret" id="aria2_secret" value=aria2_secret />
+                        <div class="torrent-client-panel" data-torrent-client="auto" style=show_auto>
+                            <p style="color: var(--text-dim); margin: 0;">
+                                "Auto mode uses the built-in fallback chain."
+                            </p>
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="embedded" style=show_embedded>
+                            <p style="color: var(--text-dim); margin: 0;">
+                                "Embedded mode uses the in-process torrent backend."
+                            </p>
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="qbittorrent" style=show_qbit>
+                            <h3>"qBittorrent"</h3>
+                            <label for="qbittorrent_host">"Host"</label>
+                            <input type="text" name="qbittorrent_host" id="qbittorrent_host" value=qb_host />
+                            <label for="qbittorrent_port">"Port"</label>
+                            <input type="number" name="qbittorrent_port" id="qbittorrent_port" value=qb_port.to_string() />
+                            <label for="qbittorrent_username">"Username"</label>
+                            <input type="text" name="qbittorrent_username" id="qbittorrent_username" value=qb_username />
+                            <label for="qbittorrent_password">"Password"</label>
+                            <input type="password" name="qbittorrent_password" id="qbittorrent_password" value=qb_password />
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="transmission" style=show_transmission>
+                            <h3>"Transmission"</h3>
+                            <label for="transmission_host">"Host"</label>
+                            <input type="text" name="transmission_host" id="transmission_host" value=transmission_host />
+                            <label for="transmission_port">"Port"</label>
+                            <input type="number" name="transmission_port" id="transmission_port" value=transmission_port.to_string() />
+                            <label for="transmission_username">"Username"</label>
+                            <input type="text" name="transmission_username" id="transmission_username" value=transmission_username />
+                            <label for="transmission_password">"Password"</label>
+                            <input type="password" name="transmission_password" id="transmission_password" value=transmission_password />
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="deluge" style=show_deluge>
+                            <h3>"Deluge"</h3>
+                            <label for="deluge_host">"Host"</label>
+                            <input type="text" name="deluge_host" id="deluge_host" value=deluge_host />
+                            <label for="deluge_port">"Port"</label>
+                            <input type="number" name="deluge_port" id="deluge_port" value=deluge_port.to_string() />
+                            <label for="deluge_username">"Username"</label>
+                            <input type="text" name="deluge_username" id="deluge_username" value=deluge_username />
+                            <label for="deluge_password">"Password"</label>
+                            <input type="password" name="deluge_password" id="deluge_password" value=deluge_password />
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="rtorrent" style=show_rtorrent>
+                            <h3>"rTorrent"</h3>
+                            <label for="rtorrent_url">"XML-RPC URL"</label>
+                            <input
+                                type="text"
+                                name="rtorrent_url"
+                                id="rtorrent_url"
+                                value=rtorrent_url
+                                placeholder="http://localhost:8000/RPC2"
+                            />
+                        </div>
+                        <div class="torrent-client-panel" data-torrent-client="aria2" style=show_aria2>
+                            <h3>"aria2"</h3>
+                            <label for="aria2_host">"Host"</label>
+                            <input type="text" name="aria2_host" id="aria2_host" value=aria2_host />
+                            <label for="aria2_port">"Port"</label>
+                            <input type="number" name="aria2_port" id="aria2_port" value=aria2_port.to_string() />
+                            <label for="aria2_secret">"Secret Token"</label>
+                            <input type="password" name="aria2_secret" id="aria2_secret" value=aria2_secret />
+                        </div>
                     </div>
 
                     <div class="card">
-                        <h2>"LLM Provider"</h2>
+                        <h2>"LLM"</h2>
                         <label for="llm_provider">"Provider"</label>
                         <select name="llm_provider" id="llm_provider">
                             <option value="claude_code" selected=llm_provider=="claude_code">"Claude Code (Max subscription)"</option>
@@ -1355,37 +1725,15 @@ fn render_config_content(
                             name="llm_model"
                             id="llm_model"
                             value=llm_model
+                            list="llm-model-suggestions"
                             placeholder="sonnet, opus, gpt-4o, llama3.2, etc."
                         />
+                        <datalist id="llm-model-suggestions"></datalist>
 
-                        <h2 style="margin-top: 1.5rem;">"Browser"</h2>
-                        <label for="browser_mode">"Browser Mode"</label>
-                        <select name="browser_mode" id="browser_mode">
-                            <option value="chrome" selected=browser_mode=="chrome">"Claude Chrome Integration"</option>
-                            <option value="browser_use" selected=browser_mode=="browser_use">"browser-use (Playwright)"</option>
-                        </select>
-
-                        <label for="browser_use_mcp_command">"browser-use MCP Command"</label>
-                        <input
-                            type="text"
-                            name="browser_use_mcp_command"
-                            id="browser_use_mcp_command"
-                            value=browser_use_mcp_command
-                            placeholder="uvx"
-                        />
-
-                        <label for="browser_use_mcp_args">"browser-use MCP Args"</label>
-                        <input
-                            type="text"
-                            name="browser_use_mcp_args"
-                            id="browser_use_mcp_args"
-                            value=browser_use_mcp_args
-                            placeholder="browser-use[mcp]"
-                        />
-
-                        <div style="font-size: 0.75rem; color: var(--text-dim); margin-top: 0.25rem;">
-                            "Used only when Browser Mode is set to browser-use."
-                        </div>
+                        <h2 style="margin-top: 1.5rem;">"Browser Integration"</h2>
+                        <p style="color: var(--text-dim); margin-top: 0;">
+                            "Graboid uses Chrome integration for browser automation."
+                        </p>
 
                         <label
                             style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; margin-top: 0.5rem;"
@@ -1402,7 +1750,16 @@ fn render_config_content(
 
                         <h2 style="margin-top: 1.5rem;">"Paths"</h2>
                         <label for="download_dir">"Download Directory"</label>
-                        <input type="text" name="download_dir" id="download_dir" value=download_dir />
+                        <input
+                            type="text"
+                            name="download_dir"
+                            id="download_dir"
+                            value=download_dir.clone()
+                            data-dir-autocomplete="1"
+                        />
+                        <div class="path-map-help">
+                            "Use directory suggestions; select `..` to move to the parent directory."
+                        </div>
 
                         <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
                             <input
@@ -1450,15 +1807,10 @@ fn render_config_content(
                             max="32"
                         />
 
-                        <label for="path_mappings">"Path Mappings (one per line, host:container)"</label>
-                        <textarea
-                            name="path_mappings"
-                            id="path_mappings"
-                            rows="4"
-                            placeholder="/mnt/downloads:/downloads"
-                        >
-                            {path_mappings}
-                        </textarea>
+                        <label>"Path Mappings"</label>
+                        <div class="path-map-help">"Map source -> destination paths for copy/extract operations."</div>
+                        <div id="path-mapping-rows" class="path-mapping-rows">{path_mapping_rows}</div>
+                        <button type="button" class="secondary" id="path-mapping-add">"Add Mapping"</button>
 
                         <h2 style="margin-top: 1.5rem;">"Logging"</h2>
                         <label for="log_level">"Log Level"</label>
@@ -1471,15 +1823,37 @@ fn render_config_content(
                     </div>
                 </div>
 
-                <div class="card">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span style="color: var(--text-dim);">"Config file: "</span>
-                            <code>{config_path.to_string()}</code>
-                        </div>
-                        <button type="submit">"Save Configuration"</button>
+                <div class="card config-sources-card">
+                    <h2>"Sources"</h2>
+                    <input type="hidden" name="source_mode" id="source_mode" value="web" />
+                    <p style="color: var(--text-dim); margin-top: 0;">
+                        "Define named SFTP/FTP/Samba endpoints for the agent plus local filesystem allowlists."
+                    </p>
+
+                    <h3 style="margin-top: 0.8rem;">"Named Remote Sources"</h3>
+                    <div class="source-endpoint-head">
+                        <span>"Name"</span>
+                        <span>"Type"</span>
+                        <span>"Host"</span>
+                        <span>"Port"</span>
+                        <span>"Path/Share"</span>
+                        <span>"Username"</span>
+                        <span>"Password"</span>
+                        <span>"Action"</span>
                     </div>
+                    <div id="source-endpoint-rows" class="source-endpoint-rows">{source_endpoint_rows}</div>
+                    <button type="button" class="secondary" id="source-endpoint-add">"Add Source"</button>
+
+                    <h3 style="margin-top: 1rem;">"Local Filesystem Access"</h3>
+                    <label>"Readable Directories"</label>
+                    <div id="local-read-rows" class="local-path-rows">{local_read_rows}</div>
+                    <button type="button" class="secondary" id="local-read-add">"Add Path"</button>
+
+                    <label style="margin-top: 0.8rem;">"Writable Directories"</label>
+                    <div id="local-write-rows" class="local-path-rows">{local_write_rows}</div>
+                    <button type="button" class="secondary" id="local-write-add">"Add Path"</button>
                 </div>
+
             </form>
         </>
     }
@@ -1665,8 +2039,8 @@ fn cfg_bool(config: &serde_json::Map<String, Value>, key: &str, default: bool) -
         .unwrap_or(default)
 }
 
-fn cfg_path_mappings(config: &serde_json::Map<String, Value>) -> String {
-    let Some(value) = config.get("path_mappings") else {
+fn cfg_string_lines(config: &serde_json::Map<String, Value>, key: &str) -> String {
+    let Some(value) = config.get(key) else {
         return String::new();
     };
 
@@ -1676,8 +2050,113 @@ fn cfg_path_mappings(config: &serde_json::Map<String, Value>) -> String {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join("\n"),
+        Value::String(value) => value
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => value_to_string(value),
     }
+}
+
+fn non_empty_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn cfg_path_mapping_pairs(config: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
+    let raw = cfg_string_lines(config, "path_mappings");
+    let mut pairs = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut parts = line.splitn(2, ':');
+            let source = parts.next().unwrap_or_default().trim().to_string();
+            let dest = parts.next().unwrap_or_default().trim().to_string();
+            (source, dest)
+        })
+        .collect::<Vec<_>>();
+
+    if pairs.is_empty() {
+        pairs.push((String::new(), String::new()));
+    }
+    pairs
+}
+
+fn cfg_source_endpoint_rows(config: &serde_json::Map<String, Value>) -> Vec<NamedSource> {
+    let mut rows = cfg_string_lines(config, "source_endpoints")
+        .lines()
+        .filter_map(parse_named_source_line)
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        let sftp_host = cfg_string(config, "source_sftp_host", "");
+        if !sftp_host.trim().is_empty() {
+            rows.push(NamedSource {
+                name: "default-sftp".to_string(),
+                kind: "sftp".to_string(),
+                host: sftp_host.trim().to_string(),
+                port: Some(
+                    cfg_i64(config, "source_sftp_port", 22).clamp(1, u16::MAX as i64) as u16,
+                ),
+                location: String::new(),
+                username: cfg_string(config, "source_sftp_username", ""),
+                password: cfg_string(config, "source_sftp_password", ""),
+            });
+        }
+
+        let ftp_host = cfg_string(config, "source_ftp_host", "");
+        if !ftp_host.trim().is_empty() {
+            rows.push(NamedSource {
+                name: "default-ftp".to_string(),
+                kind: "ftp".to_string(),
+                host: ftp_host.trim().to_string(),
+                port: Some(cfg_i64(config, "source_ftp_port", 21).clamp(1, u16::MAX as i64) as u16),
+                location: String::new(),
+                username: cfg_string(config, "source_ftp_username", ""),
+                password: cfg_string(config, "source_ftp_password", ""),
+            });
+        }
+
+        let samba_host = cfg_string(config, "source_samba_host", "");
+        if !samba_host.trim().is_empty() {
+            rows.push(NamedSource {
+                name: "default-samba".to_string(),
+                kind: "samba".to_string(),
+                host: samba_host.trim().to_string(),
+                port: Some(445),
+                location: cfg_string(config, "source_samba_share", ""),
+                username: cfg_string(config, "source_samba_username", ""),
+                password: cfg_string(config, "source_samba_password", ""),
+            });
+        }
+    }
+
+    if rows.is_empty() {
+        let source_mode = cfg_string(config, "source_mode", "web");
+        let (kind, port) = match source_mode.as_str() {
+            "ftp" => ("ftp".to_string(), Some(21_u16)),
+            "samba" => ("samba".to_string(), Some(445_u16)),
+            _ => ("sftp".to_string(), Some(22_u16)),
+        };
+        rows.push(NamedSource {
+            name: String::new(),
+            kind,
+            host: String::new(),
+            port,
+            location: String::new(),
+            username: String::new(),
+            password: String::new(),
+        });
+    }
+
+    rows
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -1748,7 +2227,7 @@ mod tests {
         let html = render_config_page(&req, &git(), &runtime(), &config, "/tmp/config.toml");
         assert!(!html.contains("{%"));
         assert!(!html.contains("{{"));
-        assert!(html.contains("Configuration saved successfully."));
+        assert!(html.contains("Configuration saved. Auto-save is now active."));
     }
 
     #[test]
@@ -1764,10 +2243,18 @@ mod tests {
             "path_mappings".to_string(),
             Value::Array(vec![Value::String("/a:/b".to_string())]),
         );
+        config.insert(
+            "source_endpoints".to_string(),
+            Value::Array(vec![Value::String(
+                "mirror\tsftp\texample.net\t22\t/files\tuser\tsecret".to_string(),
+            )]),
+        );
 
         let html = render_config_page(&req, &git(), &runtime(), &config, "/tmp/config.toml");
         assert!(html.contains("value=\"deluge\""));
         assert!(html.contains("&#x2F;a:&#x2F;b") || html.contains("/a:/b"));
+        assert!(html.contains("source-endpoint-name"));
+        assert!(html.contains("example.net"));
         assert!(!html.contains("id=\"headless\" checked"));
     }
 

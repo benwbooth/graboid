@@ -1,8 +1,9 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use gloo_net::http::Request;
-use gloo_timers::callback::Interval;
+use gloo_timers::callback::{Interval, Timeout};
 use js_sys::Date;
 use leptos::*;
 use serde::Deserialize;
@@ -12,7 +13,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{Document, HtmlElement, HtmlImageElement};
+use web_sys::{
+    Document, HtmlButtonElement, HtmlElement, HtmlFormElement, HtmlImageElement, HtmlInputElement,
+    HtmlSelectElement, HtmlTextAreaElement,
+};
 
 #[component]
 fn App() -> impl IntoView {
@@ -93,6 +97,33 @@ struct JobStepsResponse {
     steps: Vec<JobStepDetailView>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TorrentTestResponse {
+    success: bool,
+    message: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FsDirectoryEntry {
+    name: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FsListResponse {
+    path: String,
+    parent: Option<String>,
+    #[serde(default)]
+    directories: Vec<FsDirectoryEntry>,
+}
+
 #[derive(Debug)]
 struct StepCarouselState {
     selected: usize,
@@ -106,6 +137,11 @@ impl StepCarouselState {
             follow_latest: true,
         }
     }
+}
+
+thread_local! {
+    static DIR_AUTOCOMPLETE_SEQ: Cell<u64> = const { Cell::new(0) };
+    static DIR_AUTOCOMPLETE_GLOBAL_HANDLER: Cell<bool> = const { Cell::new(false) };
 }
 
 fn web_document() -> Option<Document> {
@@ -403,12 +439,43 @@ fn job_status_class(status: &str) -> &'static str {
     }
 }
 
-fn update_job_summary(job: &JobView) {
-    let progress_text = if job.progress_message.trim().is_empty() {
-        format!("{:.0}%", job.progress_percent)
+fn concise_job_activity(
+    status: &str,
+    phase: &str,
+    progress_percent: f64,
+    progress_message: &str,
+) -> String {
+    let percent = format!("{:.0}%", progress_percent.round());
+    if matches!(status, "complete" | "failed" | "cancelled") {
+        let label = match status {
+            "complete" => "Done",
+            "failed" => "Failed",
+            "cancelled" => "Cancelled",
+            _ => status,
+        };
+        return format!("{percent} {label}");
+    }
+
+    let message = progress_message.trim();
+    if message.is_empty() {
+        let phase = phase.trim();
+        if phase.is_empty() {
+            format!("{percent} Working")
+        } else {
+            format!("{percent} {phase}...")
+        }
     } else {
-        format!("{:.0}% {}", job.progress_percent, job.progress_message)
-    };
+        format!("{percent} {message}")
+    }
+}
+
+fn update_job_summary(job: &JobView) {
+    let progress_text = concise_job_activity(
+        &job.status,
+        &job.current_phase,
+        job.progress_percent,
+        &job.progress_message,
+    );
 
     set_class(
         "job-status-tag",
@@ -416,7 +483,6 @@ fn update_job_summary(job: &JobView) {
     );
     set_text("job-status-tag", &job.status);
     set_text("job-progress-text", &progress_text);
-    set_text("job-phase-text", &job.current_phase);
     let created_epoch = parse_iso_epoch(&job.created_at).unwrap_or(0);
     let updated_epoch = parse_iso_epoch(&job.updated_at).unwrap_or(0);
     set_text("job-created-text", format_relative_age(created_epoch));
@@ -438,14 +504,21 @@ fn update_job_summary(job: &JobView) {
     set_text(
         "job-source-url-text",
         if job.source_url.trim().is_empty() {
-            "-"
+            "Auto-discover (no source URL provided)"
         } else {
             &job.source_url
         },
     );
     set_text("job-destination-text", &job.destination_path);
     set_text("job-operation-text", &job.file_operation);
-    set_text("job-priority-text", job.priority.to_string());
+    set_text(
+        "job-priority-text",
+        if job.priority == 0 {
+            "Normal (0)".to_string()
+        } else {
+            job.priority.to_string()
+        },
+    );
     set_text("job-prompt-text", &job.prompt);
 
     if let Some(error_box) = web_document()
@@ -460,7 +533,17 @@ fn update_job_summary(job: &JobView) {
     }
     set_text("job-error-text", &job.error_message);
 
-    let metadata = serde_json::to_string_pretty(&job.metadata).unwrap_or_else(|_| "{}".to_string());
+    let metadata = if job.metadata.is_null()
+        || job
+            .metadata
+            .as_object()
+            .map(|map| map.is_empty())
+            .unwrap_or(false)
+    {
+        "(none)".to_string()
+    } else {
+        serde_json::to_string_pretty(&job.metadata).unwrap_or_else(|_| "{}".to_string())
+    };
     set_text("job-metadata-text", metadata);
 
     let file_filter_text = if job.file_filter.is_empty() {
@@ -470,20 +553,32 @@ fn update_job_summary(job: &JobView) {
     };
     set_text("job-file-filter-text", file_filter_text);
 
-    render_code_list("job-found-urls", &job.found_urls, "No URLs found yet.");
-    render_artifact_list(
-        "job-downloaded-files",
-        &job.id,
-        "downloaded",
-        &job.downloaded_files,
-        "No downloaded files yet.",
+    render_code_list(
+        "job-found-urls",
+        &job.found_urls,
+        "No candidate URLs found yet.",
     );
+
+    let (kind, values, hint) = if job.final_paths.is_empty() {
+        (
+            "downloaded",
+            &job.downloaded_files,
+            "Showing direct downloads (no finalized outputs yet).",
+        )
+    } else {
+        (
+            "final",
+            &job.final_paths,
+            "Showing final files after extract/filter/copy.",
+        )
+    };
+    set_text("job-output-files-help", hint);
     render_artifact_list(
-        "job-final-paths",
+        "job-output-files",
         &job.id,
-        "final",
-        &job.final_paths,
-        "No final paths yet.",
+        kind,
+        values,
+        "No output files yet.",
     );
 }
 
@@ -590,6 +685,21 @@ fn render_note_list(container_id: &str, values: &[String], empty_message: &str) 
     let Some(container) = doc.get_element_by_id(container_id) else {
         return;
     };
+    if container_id == "job-step-notes" {
+        if let Some(title) = doc
+            .get_element_by_id("job-step-notes-title")
+            .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+        {
+            let _ = title
+                .style()
+                .set_property("display", if values.is_empty() { "none" } else { "block" });
+        }
+        if let Some(container_el) = container.dyn_ref::<HtmlElement>() {
+            let _ = container_el
+                .style()
+                .set_property("display", if values.is_empty() { "none" } else { "grid" });
+        }
+    }
 
     let signature = format!("{container_id}|{}", values.join("\u{1f}"));
     if !signature_changed(&container, &signature) {
@@ -616,15 +726,15 @@ fn render_note_list(container_id: &str, values: &[String], empty_message: &str) 
     }
 }
 
-fn render_claude_messages(messages: &[String]) {
+fn render_agent_messages(messages: &[String]) {
     let Some(doc) = web_document() else {
         return;
     };
-    let Some(container) = doc.get_element_by_id("job-step-claude") else {
+    let Some(container) = doc.get_element_by_id("job-step-agent") else {
         return;
     };
 
-    let signature = format!("claude|{}", messages.join("\u{1f}"));
+    let signature = format!("agent|{}", messages.join("\u{1f}"));
     if !signature_changed(&container, &signature) {
         return;
     }
@@ -634,13 +744,13 @@ fn render_claude_messages(messages: &[String]) {
     if messages.is_empty() {
         if let Ok(empty) = doc.create_element("p") {
             let _ = empty.set_attribute("style", "color: var(--text-dim);");
-            empty.set_text_content(Some("No Claude notes for this step."));
+            empty.set_text_content(Some("No agent output for this step."));
             let _ = container.append_child(&empty);
         }
         return;
     }
 
-    for message in messages {
+    for message in messages.iter().rev() {
         let Ok(wrapper) = doc.create_element("div") else {
             continue;
         };
@@ -650,7 +760,7 @@ fn render_claude_messages(messages: &[String]) {
             continue;
         };
         role.set_class_name("role");
-        role.set_text_content(Some("Claude"));
+        role.set_text_content(Some("Agent"));
 
         let Ok(content) = doc.create_element("div") else {
             continue;
@@ -699,7 +809,7 @@ fn render_selected_step(steps: &[JobStepDetailView], state: &Rc<RefCell<StepCaro
         set_text("job-step-counter", "No steps yet");
         set_text("job-step-meta", "Waiting for first navigation step");
         set_text("job-step-observation", "No step observation available yet.");
-        render_claude_messages(&[]);
+        render_agent_messages(&[]);
         render_note_list("job-step-notes", &[], "No notes attached to this step.");
 
         if let Some(error_tag) = web_document()
@@ -788,7 +898,7 @@ fn render_selected_step(steps: &[JobStepDetailView], state: &Rc<RefCell<StepCaro
         }
     }
 
-    render_claude_messages(&step.claude_messages);
+    render_agent_messages(&step.claude_messages);
     render_note_list(
         "job-step-notes",
         &step.notes,
@@ -977,6 +1087,1513 @@ fn init_job_detail_live_updates() {
     interval.forget();
 }
 
+fn encode_component(input: &str) -> String {
+    js_sys::encode_uri_component(input)
+        .as_string()
+        .unwrap_or_else(|| input.to_string())
+}
+
+fn serialize_form_urlencoded(form: &HtmlFormElement) -> String {
+    let mut pairs = Vec::<(String, String)>::new();
+    let elements = form.elements();
+
+    for idx in 0..elements.length() {
+        let Some(element) = elements.item(idx) else {
+            continue;
+        };
+
+        let name = element.get_attribute("name").unwrap_or_default();
+        if name.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+            let kind = input.type_().to_ascii_lowercase();
+            if matches!(
+                kind.as_str(),
+                "submit" | "button" | "reset" | "file" | "image"
+            ) {
+                continue;
+            }
+            if kind == "checkbox" && !input.checked() {
+                continue;
+            }
+            pairs.push((name, input.value()));
+            continue;
+        }
+
+        if let Some(select) = element.dyn_ref::<HtmlSelectElement>() {
+            pairs.push((name, select.value()));
+            continue;
+        }
+
+        if let Some(textarea) = element.dyn_ref::<HtmlTextAreaElement>() {
+            pairs.push((name, textarea.value()));
+            continue;
+        }
+    }
+
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{}={}", encode_component(key), encode_component(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn set_config_save_status(text: &str, class_name: &str) {
+    set_text("config-save-status", text);
+    set_class("config-save-status", class_name);
+}
+
+fn sync_select_panel_visibility(select_id: &str, panel_class: &str, attr_name: &str) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(select) = doc
+        .get_element_by_id(select_id)
+        .and_then(|node| node.dyn_into::<HtmlSelectElement>().ok())
+    else {
+        return;
+    };
+
+    let selected = select.value();
+    let panels = doc.get_elements_by_class_name(panel_class);
+    for idx in 0..panels.length() {
+        let Some(panel) = panels.item(idx) else {
+            continue;
+        };
+        let show = panel
+            .get_attribute(attr_name)
+            .map(|value| value == selected)
+            .unwrap_or(false);
+        let _ = panel.set_attribute(
+            "style",
+            if show {
+                "display: block;"
+            } else {
+                "display: none;"
+            },
+        );
+    }
+}
+
+fn sync_torrent_client_panels() {
+    sync_select_panel_visibility(
+        "torrent_client",
+        "torrent-client-panel",
+        "data-torrent-client",
+    );
+}
+
+fn sync_path_mappings_hidden() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(hidden) = doc
+        .get_element_by_id("path_mappings")
+        .and_then(|node| node.dyn_into::<HtmlTextAreaElement>().ok())
+    else {
+        return;
+    };
+
+    let sources = doc.get_elements_by_class_name("path-map-source");
+    let dests = doc.get_elements_by_class_name("path-map-dest");
+    let len = sources.length().min(dests.length());
+    let mut lines = Vec::new();
+
+    for idx in 0..len {
+        let Some(source) = sources
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(dest) = dests
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let source = source.value().trim().to_string();
+        let dest = dest.value().trim().to_string();
+        if source.is_empty() && dest.is_empty() {
+            continue;
+        }
+        lines.push(format!("{source}:{dest}"));
+    }
+
+    hidden.set_value(&lines.join("\n"));
+}
+
+fn normalize_source_kind(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ftp" => "ftp".to_string(),
+        "samba" | "smb" => "samba".to_string(),
+        _ => "sftp".to_string(),
+    }
+}
+
+fn default_port_for_source_kind(kind: &str) -> u16 {
+    match normalize_source_kind(kind).as_str() {
+        "ftp" => 21,
+        "samba" => 445,
+        _ => 22,
+    }
+}
+
+fn apply_default_port_for_source_select(select: &HtmlSelectElement) {
+    let kind = normalize_source_kind(&select.value());
+    select.set_value(&kind);
+
+    let default_port = default_port_for_source_kind(&kind).to_string();
+    let Some(parent) = select.parent_element() else {
+        return;
+    };
+    let Ok(Some(port_node)) = parent.query_selector(".source-endpoint-port") else {
+        return;
+    };
+    let Ok(port_input) = port_node.dyn_into::<HtmlInputElement>() else {
+        return;
+    };
+    port_input.set_placeholder(&default_port);
+}
+
+fn sanitize_source_cell(value: &str) -> String {
+    value.replace(['\n', '\r', '\t'], " ").trim().to_string()
+}
+
+fn sync_source_endpoints_hidden() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(hidden) = doc
+        .get_element_by_id("source_endpoints")
+        .and_then(|node| node.dyn_into::<HtmlTextAreaElement>().ok())
+    else {
+        return;
+    };
+
+    let names = doc.get_elements_by_class_name("source-endpoint-name");
+    let kinds = doc.get_elements_by_class_name("source-endpoint-kind");
+    let hosts = doc.get_elements_by_class_name("source-endpoint-host");
+    let ports = doc.get_elements_by_class_name("source-endpoint-port");
+    let locations = doc.get_elements_by_class_name("source-endpoint-location");
+    let usernames = doc.get_elements_by_class_name("source-endpoint-username");
+    let passwords = doc.get_elements_by_class_name("source-endpoint-password");
+
+    let len = names
+        .length()
+        .min(kinds.length())
+        .min(hosts.length())
+        .min(ports.length())
+        .min(locations.length())
+        .min(usernames.length())
+        .min(passwords.length());
+
+    let mut lines = Vec::new();
+    for idx in 0..len {
+        let Some(name) = names
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(kind) = kinds
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlSelectElement>().ok())
+        else {
+            continue;
+        };
+        let Some(host) = hosts
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(port) = ports
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(location) = locations
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(username) = usernames
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        let Some(password) = passwords
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+
+        let name = sanitize_source_cell(&name.value());
+        let kind = normalize_source_kind(&kind.value());
+        let host = sanitize_source_cell(&host.value());
+        let port = sanitize_source_cell(&port.value());
+        let location = sanitize_source_cell(&location.value());
+        let username = sanitize_source_cell(&username.value());
+        let password = sanitize_source_cell(&password.value());
+
+        if name.is_empty()
+            && host.is_empty()
+            && location.is_empty()
+            && username.is_empty()
+            && password.is_empty()
+        {
+            continue;
+        }
+
+        lines.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            name, kind, host, port, location, username, password
+        ));
+    }
+
+    hidden.set_value(&lines.join("\n"));
+}
+
+fn create_source_endpoint_row(
+    name: &str,
+    kind: &str,
+    host: &str,
+    port: &str,
+    location: &str,
+    username: &str,
+    password: &str,
+) -> Option<HtmlElement> {
+    let doc = web_document()?;
+    let row = doc
+        .create_element("div")
+        .ok()?
+        .dyn_into::<HtmlElement>()
+        .ok()?;
+    row.set_class_name("source-endpoint-row");
+    let _ = row.set_attribute("data-source-endpoint-row", "1");
+
+    let name_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    name_input.set_type("text");
+    name_input.set_class_name("source-endpoint-name");
+    name_input.set_placeholder("source name");
+    name_input.set_value(name);
+
+    let kind_select = doc
+        .create_element("select")
+        .ok()?
+        .dyn_into::<HtmlSelectElement>()
+        .ok()?;
+    kind_select.set_class_name("source-endpoint-kind");
+    for (value, label) in [("sftp", "SFTP"), ("ftp", "FTP"), ("samba", "Samba")] {
+        let option = doc.create_element("option").ok()?;
+        let _ = option.set_attribute("value", value);
+        option.set_text_content(Some(label));
+        let _ = kind_select.append_child(&option);
+    }
+    let selected_kind = normalize_source_kind(kind);
+    kind_select.set_value(&selected_kind);
+
+    let host_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    host_input.set_type("text");
+    host_input.set_class_name("source-endpoint-host");
+    host_input.set_placeholder("host");
+    host_input.set_value(host);
+
+    let port_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    port_input.set_type("number");
+    port_input.set_class_name("source-endpoint-port");
+    let default_port = default_port_for_source_kind(&selected_kind).to_string();
+    port_input.set_placeholder(&default_port);
+    port_input.set_value(port.trim());
+
+    let location_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    location_input.set_type("text");
+    location_input.set_class_name("source-endpoint-location");
+    location_input.set_placeholder("path/share");
+    location_input.set_value(location);
+
+    let username_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    username_input.set_type("text");
+    username_input.set_class_name("source-endpoint-username");
+    username_input.set_placeholder("username");
+    username_input.set_value(username);
+
+    let password_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    password_input.set_type("password");
+    password_input.set_class_name("source-endpoint-password");
+    password_input.set_placeholder("password");
+    password_input.set_value(password);
+
+    let remove_button = doc
+        .create_element("button")
+        .ok()?
+        .dyn_into::<HtmlButtonElement>()
+        .ok()?;
+    remove_button.set_type("button");
+    remove_button.set_class_name("secondary source-endpoint-remove");
+    remove_button.set_text_content(Some("Delete"));
+
+    let _ = row.append_child(&name_input);
+    let _ = row.append_child(&kind_select);
+    let _ = row.append_child(&host_input);
+    let _ = row.append_child(&port_input);
+    let _ = row.append_child(&location_input);
+    let _ = row.append_child(&username_input);
+    let _ = row.append_child(&password_input);
+    let _ = row.append_child(&remove_button);
+    Some(row)
+}
+
+fn ensure_source_endpoint_row_exists() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(rows) = doc
+        .get_element_by_id("source-endpoint-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+
+    if doc
+        .get_elements_by_class_name("source-endpoint-row")
+        .length()
+        > 0
+    {
+        return;
+    }
+    if let Some(row) = create_source_endpoint_row("", "sftp", "", "", "", "", "") {
+        let _ = rows.append_child(&row);
+    }
+}
+
+fn create_path_mapping_row(source: &str, dest: &str) -> Option<HtmlElement> {
+    let doc = web_document()?;
+    let row = doc
+        .create_element("div")
+        .ok()?
+        .dyn_into::<HtmlElement>()
+        .ok()?;
+    row.set_class_name("path-map-row");
+    let _ = row.set_attribute("data-path-map-row", "1");
+
+    let source_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    source_input.set_class_name("path-map-source");
+    source_input.set_type("text");
+    source_input.set_placeholder("/host/path");
+    source_input.set_value(source);
+    let _ = source_input.set_attribute("data-map-source", "1");
+    let _ = source_input.set_attribute("data-dir-autocomplete", "1");
+
+    let arrow = doc
+        .create_element("span")
+        .ok()?
+        .dyn_into::<HtmlElement>()
+        .ok()?;
+    arrow.set_class_name("path-map-arrow");
+    arrow.set_text_content(Some("\u{2192}"));
+
+    let dest_input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    dest_input.set_class_name("path-map-dest");
+    dest_input.set_type("text");
+    dest_input.set_placeholder("/container/path");
+    dest_input.set_value(dest);
+    let _ = dest_input.set_attribute("data-map-dest", "1");
+    let _ = dest_input.set_attribute("data-dir-autocomplete", "1");
+
+    let remove_button = doc
+        .create_element("button")
+        .ok()?
+        .dyn_into::<HtmlButtonElement>()
+        .ok()?;
+    remove_button.set_class_name("secondary path-map-remove");
+    remove_button.set_type("button");
+    remove_button.set_text_content(Some("Delete"));
+    let _ = remove_button.set_attribute("data-path-map-remove", "1");
+
+    let _ = row.append_child(&source_input);
+    let _ = row.append_child(&arrow);
+    let _ = row.append_child(&dest_input);
+    let _ = row.append_child(&remove_button);
+    Some(row)
+}
+
+fn ensure_path_mapping_row_exists() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(rows) = doc
+        .get_element_by_id("path-mapping-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+
+    if doc.get_elements_by_class_name("path-map-row").length() > 0 {
+        return;
+    }
+    if let Some(row) = create_path_mapping_row("", "") {
+        let _ = rows.append_child(&row);
+    }
+}
+
+fn sync_local_whitelists_hidden() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+
+    let sync = |class_name: &str, textarea_id: &str| {
+        let Some(textarea) = doc
+            .get_element_by_id(textarea_id)
+            .and_then(|node| node.dyn_into::<HtmlTextAreaElement>().ok())
+        else {
+            return;
+        };
+
+        let inputs = doc.get_elements_by_class_name(class_name);
+        let mut lines = Vec::new();
+        for idx in 0..inputs.length() {
+            let Some(input) = inputs
+                .item(idx)
+                .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+            else {
+                continue;
+            };
+            let value = input.value().trim().to_string();
+            if !value.is_empty() {
+                lines.push(value);
+            }
+        }
+        textarea.set_value(&lines.join("\n"));
+    };
+
+    sync("local-read-path", "local_read_whitelist");
+    sync("local-write-path", "local_write_whitelist");
+}
+
+fn create_local_path_row(value: &str, input_class: &str, placeholder: &str) -> Option<HtmlElement> {
+    let doc = web_document()?;
+    let row = doc
+        .create_element("div")
+        .ok()?
+        .dyn_into::<HtmlElement>()
+        .ok()?;
+    row.set_class_name("local-path-row");
+    let _ = row.set_attribute("data-local-path-row", "1");
+
+    let input = doc
+        .create_element("input")
+        .ok()?
+        .dyn_into::<HtmlInputElement>()
+        .ok()?;
+    input.set_type("text");
+    input.set_class_name(&format!("local-path-input {input_class}"));
+    input.set_placeholder(placeholder);
+    input.set_value(value);
+    let _ = input.set_attribute("data-dir-autocomplete", "1");
+
+    let remove_button = doc
+        .create_element("button")
+        .ok()?
+        .dyn_into::<HtmlButtonElement>()
+        .ok()?;
+    remove_button.set_type("button");
+    remove_button.set_class_name("secondary local-path-remove");
+    remove_button.set_text_content(Some("Delete"));
+
+    let _ = row.append_child(&input);
+    let _ = row.append_child(&remove_button);
+    Some(row)
+}
+
+fn ensure_local_path_row_exists(rows_id: &str, input_class: &str, placeholder: &str) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(rows) = doc
+        .get_element_by_id(rows_id)
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+
+    if rows.get_elements_by_class_name(input_class).length() > 0 {
+        return;
+    }
+    if let Some(row) = create_local_path_row("", input_class, placeholder) {
+        let _ = rows.append_child(&row);
+    }
+}
+
+fn queue_config_autosave(form: HtmlFormElement, debounce: Rc<RefCell<Option<Timeout>>>) {
+    if let Some(timeout) = debounce.borrow_mut().take() {
+        timeout.cancel();
+    }
+
+    set_config_save_status("Saving...", "tag warning");
+    let timeout = Timeout::new(450, move || {
+        sync_path_mappings_hidden();
+        sync_source_endpoints_hidden();
+        sync_local_whitelists_hidden();
+        let body = serialize_form_urlencoded(&form);
+        spawn_local(async move {
+            let request = Request::post("/api/config")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body);
+
+            let Ok(request) = request else {
+                set_config_save_status("Save failed", "tag error");
+                return;
+            };
+            match request.send().await {
+                Ok(response) if response.ok() => {
+                    set_config_save_status("Saved", "tag success");
+                }
+                _ => {
+                    set_config_save_status("Save failed", "tag error");
+                }
+            }
+        });
+    });
+    *debounce.borrow_mut() = Some(timeout);
+}
+
+fn static_model_suggestions(provider: &str) -> Vec<String> {
+    match provider {
+        "claude_code" | "anthropic" => vec![
+            "sonnet".to_string(),
+            "opus".to_string(),
+            "haiku".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            "claude-opus-4-5-20251101".to_string(),
+        ],
+        "openai" => vec![
+            "gpt-4o".to_string(),
+            "gpt-4.1".to_string(),
+            "o3-mini".to_string(),
+        ],
+        "google" => vec!["gemini-2.0-flash".to_string(), "gemini-2.0-pro".to_string()],
+        "openrouter" => vec![
+            "anthropic/claude-sonnet-4".to_string(),
+            "openai/gpt-4o".to_string(),
+            "google/gemini-2.0-flash-001".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn set_model_suggestions(models: Vec<String>) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(datalist) = doc.get_element_by_id("llm-model-suggestions") else {
+        return;
+    };
+
+    let mut unique = BTreeSet::new();
+    for model in models {
+        let value = model.trim();
+        if !value.is_empty() {
+            unique.insert(value.to_string());
+        }
+    }
+
+    datalist.set_inner_html("");
+    for model in unique {
+        let Ok(option) = doc.create_element("option") else {
+            continue;
+        };
+        let _ = option.set_attribute("value", &model);
+        let _ = datalist.append_child(&option);
+    }
+}
+
+fn refresh_model_suggestions(provider: &str) {
+    let provider = provider.trim().to_string();
+    let fallback = static_model_suggestions(&provider);
+
+    let endpoint = match provider.as_str() {
+        "claude_code" => Some("/api/claude/models"),
+        "ollama" => Some("/api/ollama/models"),
+        _ => None,
+    };
+
+    let Some(endpoint) = endpoint else {
+        set_model_suggestions(fallback);
+        return;
+    };
+
+    spawn_local(async move {
+        let mut models = fetch_json::<ModelListResponse>(endpoint)
+            .await
+            .map(|response| response.models)
+            .unwrap_or_default();
+
+        if models.is_empty() {
+            models = fallback;
+        } else {
+            models.extend(fallback);
+        }
+        set_model_suggestions(models);
+    });
+}
+
+fn refresh_model_suggestions_from_dom() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let provider = doc
+        .get_element_by_id("llm_provider")
+        .and_then(|node| node.dyn_into::<HtmlSelectElement>().ok())
+        .map(|select| select.value())
+        .unwrap_or_else(|| "claude_code".to_string());
+    refresh_model_suggestions(&provider);
+}
+
+fn next_dir_autocomplete_id() -> String {
+    DIR_AUTOCOMPLETE_SEQ.with(|seq| {
+        let next = seq.get().saturating_add(1);
+        seq.set(next);
+        format!("dir-autocomplete-{next}")
+    })
+}
+
+#[derive(Clone)]
+struct DirectoryQuery {
+    request_path: Option<String>,
+    fallback_prefix: String,
+}
+
+fn parse_directory_query(value: &str) -> DirectoryQuery {
+    let trimmed = value.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return DirectoryQuery {
+            request_path: None,
+            fallback_prefix: String::new(),
+        };
+    }
+
+    if trimmed.contains('/') {
+        let path = trimmed.trim_end_matches('/').to_string();
+        let request_path = if path.is_empty() {
+            Some("/".to_string())
+        } else {
+            Some(path)
+        };
+        return DirectoryQuery {
+            request_path,
+            fallback_prefix: String::new(),
+        };
+    }
+
+    DirectoryQuery {
+        request_path: Some(".".to_string()),
+        fallback_prefix: trimmed,
+    }
+}
+
+fn normalize_path_key(value: &str) -> String {
+    let mut normalized = value.trim().replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn hide_all_directory_panels_except(except_panel_id: Option<&str>) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Ok(panels) = doc.query_selector_all(".dir-autocomplete-panel") else {
+        return;
+    };
+
+    for idx in 0..panels.length() {
+        let Some(panel) = panels
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+        else {
+            continue;
+        };
+
+        if except_panel_id
+            .map(|panel_id| panel.id() == panel_id)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let _ = panel.style().set_property("display", "none");
+    }
+}
+
+fn hide_directory_panel(panel_id: &str) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(panel) = doc
+        .get_element_by_id(panel_id)
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    let _ = panel.style().set_property("display", "none");
+}
+
+fn ensure_directory_panel(panel_id: &str) -> Option<HtmlElement> {
+    let doc = web_document()?;
+
+    if let Some(existing) = doc
+        .get_element_by_id(panel_id)
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    {
+        return Some(existing);
+    }
+
+    let panel = doc
+        .create_element("div")
+        .ok()?
+        .dyn_into::<HtmlElement>()
+        .ok()?;
+    panel.set_id(panel_id);
+    panel.set_class_name("dir-autocomplete-panel");
+    let _ = panel.set_attribute("role", "listbox");
+    let _ = panel.style().set_property("display", "none");
+
+    // Prevent click-to-select from blurring/closing the panel.
+    {
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+        });
+        let _ =
+            panel.add_event_listener_with_callback("mousedown", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(body) = doc.body() {
+        let _ = body.append_child(&panel);
+        Some(panel)
+    } else {
+        None
+    }
+}
+
+fn position_directory_panel(input: &HtmlInputElement, panel: &HtmlElement) {
+    let Ok(input_element) = input.clone().dyn_into::<HtmlElement>() else {
+        return;
+    };
+
+    let mut left = 0_i32;
+    let mut top = 0_i32;
+    let mut current = Some(input_element.clone());
+    while let Some(node) = current {
+        left += node.offset_left();
+        top += node.offset_top();
+        current = node
+            .offset_parent()
+            .and_then(|parent| parent.dyn_into::<HtmlElement>().ok());
+    }
+    let top = top + input_element.offset_height() + 4;
+    let width = input_element.offset_width().max(220);
+
+    let style = panel.style();
+    let _ = style.set_property("left", &format!("{left}px"));
+    let _ = style.set_property("top", &format!("{top}px"));
+    let _ = style.set_property("width", &format!("{width}px"));
+}
+
+fn show_directory_panel_for_input(input: &HtmlInputElement, panel_id: &str) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(panel) = doc
+        .get_element_by_id(panel_id)
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+
+    hide_all_directory_panels_except(Some(panel_id));
+    position_directory_panel(input, &panel);
+    let _ = panel.style().set_property("display", "block");
+}
+
+fn render_directory_suggestions(
+    input: &HtmlInputElement,
+    panel_id: &str,
+    query: &DirectoryQuery,
+    payload: FsListResponse,
+) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(panel) = doc
+        .get_element_by_id(panel_id)
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+
+    panel.set_inner_html("");
+
+    let effective_prefix = if query.fallback_prefix.trim().is_empty() {
+        String::new()
+    } else {
+        query.fallback_prefix.trim().to_ascii_lowercase()
+    };
+
+    let mut option_count = 0usize;
+    if let Some(parent) = payload.parent.as_deref() {
+        let Ok(button_node) = doc.create_element("button") else {
+            return;
+        };
+        let Ok(button) = button_node.dyn_into::<HtmlButtonElement>() else {
+            return;
+        };
+        button.set_type("button");
+        button.set_class_name("dir-autocomplete-item parent");
+        button.set_text_content(Some(".."));
+        let _ = button.set_attribute("title", parent);
+
+        let parent_path = parent.to_string();
+        let input_ref = input.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            input_ref.set_value(&parent_path);
+            if let Ok(input_event) = web_sys::Event::new("input") {
+                let _ = input_ref.dispatch_event(&input_event);
+            }
+        });
+        let _ =
+            button.add_event_listener_with_callback("mousedown", callback.as_ref().unchecked_ref());
+        callback.forget();
+
+        let _ = panel.append_child(&button);
+        option_count += 1;
+    }
+
+    let payload_path = normalize_path_key(&payload.path);
+    let current_value = normalize_path_key(&input.value());
+    let mut directories = payload.directories;
+    directories.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
+
+    for entry in directories {
+        if !effective_prefix.is_empty()
+            && !entry
+                .name
+                .to_ascii_lowercase()
+                .starts_with(&effective_prefix)
+        {
+            continue;
+        }
+
+        // If the query resolved to this exact directory, skip rendering itself.
+        if payload_path == current_value && normalize_path_key(&entry.path) == current_value {
+            continue;
+        }
+
+        let Ok(button_node) = doc.create_element("button") else {
+            continue;
+        };
+        let Ok(button) = button_node.dyn_into::<HtmlButtonElement>() else {
+            continue;
+        };
+        button.set_type("button");
+        button.set_class_name("dir-autocomplete-item");
+        button.set_text_content(Some(&entry.name));
+        let _ = button.set_attribute("title", &entry.path);
+
+        let next_path = entry.path.clone();
+        let input_ref = input.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            input_ref.set_value(&next_path);
+            if let Ok(input_event) = web_sys::Event::new("input") {
+                let _ = input_ref.dispatch_event(&input_event);
+            }
+        });
+        let _ =
+            button.add_event_listener_with_callback("mousedown", callback.as_ref().unchecked_ref());
+        callback.forget();
+
+        let _ = panel.append_child(&button);
+        option_count += 1;
+    }
+
+    if option_count == 0 {
+        if let Ok(empty) = doc.create_element("div") {
+            empty.set_class_name("dir-autocomplete-empty");
+            empty.set_text_content(Some("No subdirectories"));
+            let _ = panel.append_child(&empty);
+        }
+    }
+
+    show_directory_panel_for_input(input, panel_id);
+}
+
+fn refresh_directory_suggestions(input: HtmlInputElement) {
+    let Some(panel_id) = input
+        .get_attribute("data-dir-panel-id")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+
+    let current_value = input.value();
+    let query = parse_directory_query(&current_value);
+    let request_token = format!("{:.3}", Date::now());
+    let _ = input.set_attribute("data-dir-request-token", &request_token);
+
+    let mut url = "/api/fs/list".to_string();
+    if let Some(path) = query.request_path.as_deref() {
+        url = format!("/api/fs/list?path={}", encode_component(path));
+    }
+
+    spawn_local(async move {
+        let payload = fetch_json::<FsListResponse>(&url).await;
+        let still_latest = input
+            .get_attribute("data-dir-request-token")
+            .map(|token| token == request_token)
+            .unwrap_or(false);
+        if !still_latest {
+            return;
+        }
+
+        if let Some(payload) = payload {
+            render_directory_suggestions(&input, &panel_id, &query, payload);
+        } else {
+            hide_directory_panel(&panel_id);
+        }
+    });
+}
+
+fn ensure_directory_global_handlers() {
+    let already = DIR_AUTOCOMPLETE_GLOBAL_HANDLER.with(|flag| {
+        if flag.get() {
+            true
+        } else {
+            flag.set(true);
+            false
+        }
+    });
+    if already {
+        return;
+    }
+
+    let Some(doc) = web_document() else {
+        return;
+    };
+
+    {
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(target) = event
+                .target()
+                .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+            else {
+                hide_all_directory_panels_except(None);
+                return;
+            };
+
+            if target
+                .closest("input[data-dir-autocomplete='1']")
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+            if target
+                .closest(".dir-autocomplete-panel")
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+
+            hide_all_directory_panels_except(None);
+        });
+        let _ =
+            doc.add_event_listener_with_callback("mousedown", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+fn ensure_directory_autocomplete_input(input: &HtmlInputElement) {
+    if input.get_attribute("data-dir-autocomplete-init").as_deref() == Some("1") {
+        return;
+    }
+
+    ensure_directory_global_handlers();
+
+    let input_id = if input.id().trim().is_empty() {
+        let generated = next_dir_autocomplete_id();
+        input.set_id(&generated);
+        generated
+    } else {
+        input.id()
+    };
+    let panel_id = format!("{input_id}-dir-panel");
+    let _ = input.set_attribute("data-dir-panel-id", &panel_id);
+    let _ = input.set_attribute("autocomplete", "off");
+    let _ = ensure_directory_panel(&panel_id);
+
+    let _ = input.set_attribute("data-dir-autocomplete-init", "1");
+
+    {
+        let input_ref = input.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            refresh_directory_suggestions(input_ref.clone());
+        });
+        let _ = input.add_event_listener_with_callback("focus", callback.as_ref().unchecked_ref());
+        let _ = input.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        let _ = input.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    {
+        let panel_id_ref = panel_id.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            // Delay hide to allow mousedown handlers on panel options to run.
+            let panel_id = panel_id_ref.clone();
+            Timeout::new(140, move || {
+                hide_directory_panel(&panel_id);
+            })
+            .forget();
+        });
+        let _ = input.add_event_listener_with_callback("blur", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
+fn init_directory_autocomplete_inputs() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Ok(inputs) = doc.query_selector_all("input[data-dir-autocomplete='1']") else {
+        return;
+    };
+
+    for idx in 0..inputs.length() {
+        let Some(input) = inputs
+            .item(idx)
+            .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        else {
+            continue;
+        };
+        ensure_directory_autocomplete_input(&input);
+    }
+}
+
+fn init_config_live_form() {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(form) = doc
+        .get_element_by_id("config-form")
+        .and_then(|node| node.dyn_into::<HtmlFormElement>().ok())
+    else {
+        return;
+    };
+
+    sync_torrent_client_panels();
+    sync_path_mappings_hidden();
+    sync_source_endpoints_hidden();
+    sync_local_whitelists_hidden();
+    ensure_path_mapping_row_exists();
+    ensure_source_endpoint_row_exists();
+    ensure_local_path_row_exists("local-read-rows", "local-read-path", "/mnt/data");
+    ensure_local_path_row_exists("local-write-rows", "local-write-path", "/mnt/downloads");
+    init_directory_autocomplete_inputs();
+    refresh_model_suggestions_from_dom();
+    set_config_save_status("Auto-save enabled", "tag");
+
+    let autosave_debounce = Rc::new(RefCell::new(None::<Timeout>));
+
+    {
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+        });
+        let _ = form.add_event_listener_with_callback("submit", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let target = event
+                .target()
+                .and_then(|node| node.dyn_into::<web_sys::Element>().ok());
+            let target_id = target.as_ref().map(|node| node.id()).unwrap_or_default();
+
+            if let Some(target) = target.as_ref() {
+                if target.class_list().contains("source-endpoint-kind") {
+                    if let Ok(select) = target.clone().dyn_into::<HtmlSelectElement>() {
+                        apply_default_port_for_source_select(&select);
+                    }
+                }
+            }
+
+            if target_id == "torrent_client" {
+                sync_torrent_client_panels();
+            } else if target_id == "llm_provider" {
+                refresh_model_suggestions_from_dom();
+            }
+
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            queue_config_autosave(form_ref.clone(), debounce.clone());
+        });
+        let _ = form.add_event_listener_with_callback("input", callback.as_ref().unchecked_ref());
+        let _ = form.add_event_listener_with_callback("change", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(add_button) = doc
+        .get_element_by_id("path-mapping-add")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(doc) = web_document() else {
+                return;
+            };
+            let Some(rows) = doc
+                .get_element_by_id("path-mapping-rows")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if let Some(row) = create_path_mapping_row("", "") {
+                let _ = rows.append_child(&row);
+                init_directory_autocomplete_inputs();
+                sync_path_mappings_hidden();
+                sync_source_endpoints_hidden();
+                sync_local_whitelists_hidden();
+                queue_config_autosave(form_ref.clone(), debounce.clone());
+            }
+        });
+        let _ =
+            add_button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(rows) = doc
+        .get_element_by_id("path-mapping-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(target) = event
+                .target()
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if !target.class_list().contains("path-map-remove") {
+                return;
+            }
+            event.prevent_default();
+
+            if let Some(parent) = target.parent_element() {
+                parent.remove();
+            }
+            ensure_path_mapping_row_exists();
+            init_directory_autocomplete_inputs();
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            queue_config_autosave(form_ref.clone(), debounce.clone());
+        });
+        let _ = rows.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(add_button) = doc
+        .get_element_by_id("source-endpoint-add")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(doc) = web_document() else {
+                return;
+            };
+            let Some(rows) = doc
+                .get_element_by_id("source-endpoint-rows")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if let Some(row) = create_source_endpoint_row("", "sftp", "", "", "", "", "") {
+                let _ = rows.append_child(&row);
+                sync_source_endpoints_hidden();
+                queue_config_autosave(form_ref.clone(), debounce.clone());
+            }
+        });
+        let _ =
+            add_button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(rows) = doc
+        .get_element_by_id("source-endpoint-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(target) = event
+                .target()
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if !target.class_list().contains("source-endpoint-remove") {
+                return;
+            }
+            event.prevent_default();
+
+            if let Some(parent) = target.parent_element() {
+                parent.remove();
+            }
+            ensure_source_endpoint_row_exists();
+            sync_source_endpoints_hidden();
+            queue_config_autosave(form_ref.clone(), debounce.clone());
+        });
+        let _ = rows.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(button) = doc
+        .get_element_by_id("test-torrent-client")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            set_text("torrent-test-result", "Testing...");
+            set_class("torrent-test-result", "config-inline-status");
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            let body = serialize_form_urlencoded(&form_ref);
+            spawn_local(async move {
+                let request = Request::post("/api/test/torrent")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(body);
+                let Ok(request) = request else {
+                    set_text("torrent-test-result", "Request error");
+                    set_class("torrent-test-result", "config-inline-status error");
+                    return;
+                };
+
+                let Ok(response) = request.send().await else {
+                    set_text("torrent-test-result", "Connection failed");
+                    set_class("torrent-test-result", "config-inline-status error");
+                    return;
+                };
+                let payload = response.json::<TorrentTestResponse>().await.ok();
+                if let Some(payload) = payload {
+                    if payload.success {
+                        let message = payload
+                            .message
+                            .unwrap_or_else(|| "Connection successful".to_string());
+                        set_text("torrent-test-result", message);
+                        set_class("torrent-test-result", "config-inline-status success");
+                    } else {
+                        let message = payload
+                            .error
+                            .unwrap_or_else(|| "Connection failed".to_string());
+                        set_text("torrent-test-result", message);
+                        set_class("torrent-test-result", "config-inline-status error");
+                    }
+                } else {
+                    set_text("torrent-test-result", "Unexpected response");
+                    set_class("torrent-test-result", "config-inline-status error");
+                }
+            });
+        });
+        let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(add_button) = doc
+        .get_element_by_id("local-read-add")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(doc) = web_document() else {
+                return;
+            };
+            let Some(rows) = doc
+                .get_element_by_id("local-read-rows")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if let Some(row) = create_local_path_row("", "local-read-path", "/mnt/data") {
+                let _ = rows.append_child(&row);
+                init_directory_autocomplete_inputs();
+                sync_path_mappings_hidden();
+                sync_source_endpoints_hidden();
+                sync_local_whitelists_hidden();
+                queue_config_autosave(form_ref.clone(), debounce.clone());
+            }
+        });
+        let _ =
+            add_button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(add_button) = doc
+        .get_element_by_id("local-write-add")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let Some(doc) = web_document() else {
+                return;
+            };
+            let Some(rows) = doc
+                .get_element_by_id("local-write-rows")
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if let Some(row) = create_local_path_row("", "local-write-path", "/mnt/downloads") {
+                let _ = rows.append_child(&row);
+                init_directory_autocomplete_inputs();
+                sync_path_mappings_hidden();
+                sync_source_endpoints_hidden();
+                sync_local_whitelists_hidden();
+                queue_config_autosave(form_ref.clone(), debounce.clone());
+            }
+        });
+        let _ =
+            add_button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(rows) = doc
+        .get_element_by_id("local-read-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(target) = event
+                .target()
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if !target.class_list().contains("local-path-remove") {
+                return;
+            }
+            event.prevent_default();
+
+            if let Some(parent) = target.parent_element() {
+                parent.remove();
+            }
+            ensure_local_path_row_exists("local-read-rows", "local-read-path", "/mnt/data");
+            init_directory_autocomplete_inputs();
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            queue_config_autosave(form_ref.clone(), debounce.clone());
+        });
+        let _ = rows.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(rows) = doc
+        .get_element_by_id("local-write-rows")
+        .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+    {
+        let form_ref = form.clone();
+        let debounce = autosave_debounce.clone();
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            let Some(target) = event
+                .target()
+                .and_then(|node| node.dyn_into::<HtmlElement>().ok())
+            else {
+                return;
+            };
+            if !target.class_list().contains("local-path-remove") {
+                return;
+            }
+            event.prevent_default();
+
+            if let Some(parent) = target.parent_element() {
+                parent.remove();
+            }
+            ensure_local_path_row_exists("local-write-rows", "local-write-path", "/mnt/downloads");
+            init_directory_autocomplete_inputs();
+            sync_path_mappings_hidden();
+            sync_source_endpoints_hidden();
+            sync_local_whitelists_hidden();
+            queue_config_autosave(form_ref.clone(), debounce.clone());
+        });
+        let _ = rows.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+}
+
 async fn fetch_json<T>(url: &str) -> Option<T>
 where
     T: DeserializeOwned,
@@ -1002,4 +2619,5 @@ fn main() {
 
     start_status_poller();
     init_job_detail_live_updates();
+    init_config_live_form();
 }

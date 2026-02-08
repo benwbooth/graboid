@@ -576,6 +576,175 @@ pre {
     color: inherit;
 }
 
+.torrent-client-panel {
+    border: 1px solid #2a4264;
+    border-radius: 10px;
+    padding: 0.75rem;
+    margin-top: 0.75rem;
+    background: #0d1a2d;
+}
+
+.torrent-client-panel h3 {
+    margin: 0 0 0.65rem;
+    font-size: 0.92rem;
+    color: #c4d6ef;
+}
+
+.config-inline-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.4rem;
+}
+
+.config-inline-status {
+    font-size: 0.82rem;
+    color: var(--text-dim);
+}
+
+.config-inline-status.success {
+    color: #9be4be;
+}
+
+.config-inline-status.error {
+    color: #ffc4c4;
+}
+
+.path-map-help {
+    color: var(--text-dim);
+    font-size: 0.78rem;
+    margin-bottom: 0.45rem;
+}
+
+.dir-autocomplete-panel {
+    position: absolute;
+    z-index: 1200;
+    border: 1px solid #32527d;
+    border-radius: 10px;
+    background: #0b1628;
+    box-shadow: 0 14px 28px rgba(0, 0, 0, 0.45);
+    max-height: 260px;
+    overflow: auto;
+    padding: 0.25rem;
+}
+
+.dir-autocomplete-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #d3e1f6;
+    text-align: left;
+    padding: 0.48rem 0.55rem;
+    margin: 0;
+    cursor: pointer;
+    font-size: 0.82rem;
+    line-height: 1.2;
+}
+
+.dir-autocomplete-item:hover,
+.dir-autocomplete-item:focus-visible {
+    background: #1b3251;
+    color: #e8f3ff;
+    outline: none;
+}
+
+.dir-autocomplete-item.parent {
+    color: #9dc9ff;
+    font-family: var(--font-mono);
+}
+
+.dir-autocomplete-empty {
+    padding: 0.5rem 0.55rem;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+}
+
+.source-endpoint-rows {
+    display: grid;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+}
+
+.source-endpoint-head {
+    display: grid;
+    grid-template-columns: minmax(9rem, 1fr) minmax(6rem, 0.7fr) minmax(12rem, 1.25fr) 5.5rem minmax(10rem, 1.1fr) minmax(8rem, 0.9fr) minmax(8rem, 0.9fr) auto;
+    gap: 0.4rem;
+    align-items: center;
+    margin-bottom: 0.4rem;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-dim);
+}
+
+.source-endpoint-row {
+    display: grid;
+    grid-template-columns: minmax(9rem, 1fr) minmax(6rem, 0.7fr) minmax(12rem, 1.25fr) 5.5rem minmax(10rem, 1.1fr) minmax(8rem, 0.9fr) minmax(8rem, 0.9fr) auto;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.source-endpoint-row input,
+.source-endpoint-row select {
+    margin-bottom: 0;
+}
+
+.config-sources-card {
+    overflow-x: auto;
+}
+
+.config-sources-card .source-endpoint-rows {
+    min-width: 1120px;
+}
+
+.config-sources-card .source-endpoint-head {
+    min-width: 1120px;
+}
+
+.path-mapping-rows {
+    display: grid;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+}
+
+.path-map-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+    gap: 0.45rem;
+    align-items: center;
+}
+
+.path-map-row input {
+    margin-bottom: 0;
+}
+
+.path-map-arrow {
+    color: var(--text-dim);
+    font-size: 0.95rem;
+}
+
+.local-path-rows {
+    display: grid;
+    gap: 0.5rem;
+    margin-bottom: 0.55rem;
+}
+
+.local-path-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0.45rem;
+    align-items: center;
+}
+
+.local-path-row input {
+    margin-bottom: 0;
+}
+
 @media (max-width: 1160px) {
     .job-detail-layout {
         grid-template-columns: 1fr;
@@ -608,5 +777,28 @@ pre {
     th,
     td {
         padding: 0.45rem;
+    }
+
+    .path-map-row {
+        grid-template-columns: 1fr;
+        gap: 0.35rem;
+    }
+
+    .source-endpoint-row {
+        grid-template-columns: 1fr;
+        gap: 0.35rem;
+    }
+
+    .local-path-row {
+        grid-template-columns: 1fr;
+        gap: 0.35rem;
+    }
+
+    .source-endpoint-head {
+        display: none;
+    }
+
+    .path-map-arrow {
+        display: none;
     }
 }

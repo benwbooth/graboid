@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +26,8 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
 
 use crate::config::{
-    generate_api_key, load_config_flat_json, persist_api_key, persist_flat_config,
+    build_flat_config_from_form, generate_api_key, load_config_flat_json, persist_api_key,
+    persist_flat_config,
 };
 use crate::events::ServerEvent;
 use crate::models::{CreateJobRequest, Job, JobListResponse, JobStatus, JobStepDetail};
@@ -57,6 +59,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/jobs/{job_id}/requeue", post(requeue_job_form))
         .route("/ws", get(ws_upgrade))
         .route("/api/status", get(api_status))
+        .route("/api/config", post(api_config_save))
+        .route("/api/fs/list", get(api_fs_list))
         .route("/api/test/torrent", post(api_test_torrent))
         .route("/api/test/llm", post(api_test_llm))
         .route("/api/ollama/models", get(api_ollama_models))
@@ -65,7 +69,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/logs", get(api_logs))
         .route("/api/v1/jobs", post(create_job).get(list_jobs))
         .route("/api/v1/jobs/{job_id}", get(get_job).delete(cancel_job))
+        .route("/api/v1/jobs/{job_id}/detail", get(get_job_detail))
         .route("/api/v1/jobs/{job_id}/stream", get(stream_job))
+        .route("/api/v1/jobs/{job_id}/events", get(stream_job_events))
         .route(
             "/api/v1/jobs/{job_id}/screenshots",
             get(get_job_screenshots),
@@ -175,12 +181,13 @@ async fn config_page(
     let config_map = load_config_flat_json(&state.config_path);
     let runtime = runtime_badge(&state).await;
     let request = request_context(&uri, &headers, &query);
+    let config_path_display = display_config_path(&state.config_path);
     let page = ui::render_config_page(
         &request,
         &state.git_info,
         &runtime,
         &config_map,
-        &state.config_path.display().to_string(),
+        &config_path_display,
     );
     Ok(Html(page).into_response())
 }
@@ -194,141 +201,105 @@ async fn config_save(
         return Ok(Redirect::to("/login").into_response());
     }
 
-    let path_mappings = form
-        .get("path_mappings")
-        .map(|raw| {
-            raw.lines()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let mut flat = BTreeMap::new();
-    flat.insert(
-        "llm_provider".to_string(),
-        json_str(form.get("llm_provider"), "claude_code"),
-    );
-    flat.insert(
-        "llm_model".to_string(),
-        json_str(form.get("llm_model"), "sonnet"),
-    );
-    flat.insert(
-        "browser_mode".to_string(),
-        json_str(form.get("browser_mode"), "chrome"),
-    );
-    flat.insert(
-        "browser_use_mcp_command".to_string(),
-        json_str(form.get("browser_use_mcp_command"), "uvx"),
-    );
-    flat.insert(
-        "browser_use_mcp_args".to_string(),
-        json_str(form.get("browser_use_mcp_args"), "browser-use[mcp]"),
-    );
-    flat.insert(
-        "torrent_client".to_string(),
-        json_str(form.get("torrent_client"), "embedded"),
-    );
-    flat.insert(
-        "qbittorrent_host".to_string(),
-        json_str(form.get("qbittorrent_host"), "localhost"),
-    );
-    flat.insert(
-        "qbittorrent_port".to_string(),
-        json_num(form.get("qbittorrent_port"), 8080),
-    );
-    flat.insert(
-        "qbittorrent_username".to_string(),
-        json_str(form.get("qbittorrent_username"), "admin"),
-    );
-    flat.insert(
-        "qbittorrent_password".to_string(),
-        json_str(form.get("qbittorrent_password"), "adminadmin"),
-    );
-    flat.insert(
-        "transmission_host".to_string(),
-        json_str(form.get("transmission_host"), "localhost"),
-    );
-    flat.insert(
-        "transmission_port".to_string(),
-        json_num(form.get("transmission_port"), 9091),
-    );
-    flat.insert(
-        "transmission_username".to_string(),
-        json_str(form.get("transmission_username"), ""),
-    );
-    flat.insert(
-        "transmission_password".to_string(),
-        json_str(form.get("transmission_password"), ""),
-    );
-    flat.insert(
-        "deluge_host".to_string(),
-        json_str(form.get("deluge_host"), "localhost"),
-    );
-    flat.insert(
-        "deluge_port".to_string(),
-        json_num(form.get("deluge_port"), 58846),
-    );
-    flat.insert(
-        "deluge_username".to_string(),
-        json_str(form.get("deluge_username"), "localclient"),
-    );
-    flat.insert(
-        "deluge_password".to_string(),
-        json_str(form.get("deluge_password"), "deluge"),
-    );
-    flat.insert(
-        "rtorrent_url".to_string(),
-        json_str(form.get("rtorrent_url"), ""),
-    );
-    flat.insert(
-        "aria2_host".to_string(),
-        json_str(form.get("aria2_host"), "localhost"),
-    );
-    flat.insert(
-        "aria2_port".to_string(),
-        json_num(form.get("aria2_port"), 6800),
-    );
-    flat.insert(
-        "aria2_secret".to_string(),
-        json_str(form.get("aria2_secret"), ""),
-    );
-    flat.insert(
-        "download_dir".to_string(),
-        json_str(form.get("download_dir"), "./downloads"),
-    );
-    flat.insert(
-        "download_retry_attempts".to_string(),
-        json_num(form.get("download_retry_attempts"), 2),
-    );
-    flat.insert(
-        "download_max_parallel".to_string(),
-        json_num(form.get("download_max_parallel"), 4),
-    );
-    flat.insert(
-        "download_retry_backoff_sec".to_string(),
-        json_float(form.get("download_retry_backoff_sec"), 2.0),
-    );
-    flat.insert(
-        "path_mappings".to_string(),
-        Value::Array(path_mappings.into_iter().map(Value::String).collect()),
-    );
-    flat.insert(
-        "headless".to_string(),
-        Value::Bool(form.contains_key("headless")),
-    );
-    flat.insert(
-        "download_allow_insecure".to_string(),
-        Value::Bool(form.contains_key("download_allow_insecure")),
-    );
-    flat.insert(
-        "log_level".to_string(),
-        json_str(form.get("log_level"), "INFO"),
-    );
-
+    let flat = build_flat_config_from_form(&form);
     persist_flat_config(&state.config_path, &flat).map_err(ApiError::internal)?;
     Ok(Redirect::to("/config?saved=1").into_response())
+}
+
+async fn api_config_save(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Not authenticated"));
+    }
+
+    let flat = build_flat_config_from_form(&form);
+    persist_flat_config(&state.config_path, &flat).map_err(ApiError::internal)?;
+    Ok(Json(json!({"success": true})))
+}
+
+#[derive(Debug, Deserialize)]
+struct FsListQuery {
+    path: Option<String>,
+}
+
+async fn api_fs_list(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Query(query): Query<FsListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if current_user(&jar, &state).is_none() {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "Not authenticated"));
+    }
+
+    let requested = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&state.config.download_dir);
+
+    let mut root = PathBuf::from(requested);
+    if !root.is_absolute() {
+        root = state.project_root.join(root);
+    }
+
+    let mut canonical = tokio::fs::canonicalize(&root)
+        .await
+        .unwrap_or_else(|_| root.clone());
+
+    let metadata = tokio::fs::metadata(&canonical).await;
+    match metadata {
+        Ok(meta) if meta.is_dir() => {}
+        _ => {
+            if let Some(parent) = canonical.parent() {
+                canonical = parent.to_path_buf();
+            }
+        }
+    }
+
+    let canonical = tokio::fs::canonicalize(&canonical)
+        .await
+        .unwrap_or(canonical);
+    let meta = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|_| ApiError::bad_request("Path is not readable"))?;
+    if !meta.is_dir() {
+        return Err(ApiError::bad_request("Path is not a directory"));
+    }
+
+    let mut read_dir = tokio::fs::read_dir(&canonical)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut directories = Vec::<(String, String)>::new();
+    while let Some(entry) = read_dir.next_entry().await.map_err(ApiError::internal)? {
+        let entry_meta = entry.metadata().await.map_err(ApiError::internal)?;
+        if !entry_meta.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path().display().to_string();
+        directories.push((name, path));
+    }
+    directories.sort_by(|left, right| {
+        left.0
+            .to_ascii_lowercase()
+            .cmp(&right.0.to_ascii_lowercase())
+    });
+
+    let payload = directories
+        .into_iter()
+        .map(|(name, path)| json!({"name": name, "path": path}))
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "path": canonical.display().to_string(),
+        "parent": canonical.parent().map(|parent| parent.display().to_string()),
+        "directories": payload,
+    })))
 }
 
 async fn notes_page(
@@ -1097,6 +1068,24 @@ async fn get_job(
     Ok(Json(job))
 }
 
+#[derive(Debug, Deserialize)]
+struct JobDetailQuery {
+    api_key: Option<String>,
+    logs_limit: Option<i64>,
+}
+
+async fn get_job_detail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<JobDetailQuery>,
+) -> Result<Json<Value>, ApiError> {
+    verify_api_key(&headers, query.api_key.as_deref(), &state).await?;
+    let log_limit = query.logs_limit.unwrap_or(500).clamp(1, 5000);
+    let payload = build_job_detail_payload(&state, &job_id, log_limit).await?;
+    Ok(Json(payload))
+}
+
 async fn cancel_job(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1111,6 +1100,25 @@ async fn cancel_job(
     }
 
     Ok(Json(json!({"status": "cancelled", "job_id": job_id})))
+}
+
+async fn build_job_detail_payload(
+    state: &Arc<AppState>,
+    job_id: &str,
+    log_limit: i64,
+) -> Result<Value, ApiError> {
+    let Some(job) = state.db.get_job(job_id).await? else {
+        return Err(ApiError::not_found("job not found"));
+    };
+
+    let steps = build_job_step_details(state, job_id).await?;
+    let logs = state.db.list_logs(job_id, log_limit.clamp(1, 5000)).await?;
+
+    Ok(json!({
+        "job": job,
+        "steps": steps,
+        "logs": logs,
+    }))
 }
 
 async fn stream_job(
@@ -1164,6 +1172,90 @@ async fn stream_job(
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!("job stream lagged by {skipped} events");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))))
+}
+
+async fn stream_job_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Query(query): Query<ApiKeyQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    verify_api_key(&headers, query.api_key.as_deref(), &state).await?;
+
+    let Some(initial_job) = state.db.get_job(&job_id).await? else {
+        return Err(ApiError::not_found("job not found"));
+    };
+
+    let state_for_stream = state.clone();
+    let mut rx = state.events.subscribe();
+    let stream = stream! {
+        match build_job_detail_payload(&state_for_stream, &job_id, 500).await {
+            Ok(snapshot) => {
+                yield Ok(Event::default().event("snapshot").data(snapshot.to_string()));
+            }
+            Err(err) => {
+                let payload = json!({"error": err.message.clone()});
+                yield Ok(Event::default().event("error").data(payload.to_string()));
+            }
+        }
+
+        if initial_job.status.is_terminal() {
+            let done = serde_json::to_string(&initial_job).unwrap_or_else(|_| "{}".to_string());
+            yield Ok(Event::default().event("complete").data(done));
+            return;
+        }
+
+        let mut seen_log_ids = HashSet::new();
+        let mut seen_step_ids = HashSet::new();
+        let mut seen_screenshot_ids = HashSet::new();
+
+        loop {
+            match rx.recv().await {
+                Ok(ServerEvent::JobUpdate(job)) if job.id == job_id => {
+                    let payload = serde_json::to_string(&job).unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(Event::default().event("job_update").data(payload));
+                    if job.status.is_terminal() {
+                        let done = serde_json::to_string(&job).unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(Event::default().event("complete").data(done));
+                        break;
+                    }
+                }
+                Ok(ServerEvent::JobLog(log)) if log.job_id == job_id => {
+                    if seen_log_ids.insert(log.id) {
+                        let payload = serde_json::to_string(&log).unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(Event::default().event("job_log").data(payload));
+                    }
+                }
+                Ok(ServerEvent::JobStep(step)) if step.job_id == job_id => {
+                    if seen_step_ids.insert(step.id) {
+                        let payload = serde_json::to_string(&step).unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(Event::default().event("job_step").data(payload));
+                    }
+                }
+                Ok(ServerEvent::JobScreenshot(shot)) if shot.job_id == job_id => {
+                    if seen_screenshot_ids.insert(shot.id) {
+                        let payload = json!({
+                            "id": shot.id,
+                            "job_id": shot.job_id,
+                            "timestamp": shot.timestamp,
+                            "url": shot.url,
+                            "phase": shot.phase,
+                            "step_number": shot.step_number,
+                            "data_base64": STANDARD.encode(&shot.screenshot_data),
+                        });
+                        yield Ok(Event::default().event("job_screenshot").data(payload.to_string()));
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("job event stream lagged by {skipped} events");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -2014,6 +2106,29 @@ fn has_explicit_port(base: &str) -> bool {
         .is_some()
 }
 
+fn display_config_path(path: &PathBuf) -> String {
+    let absolute = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.clone())
+    };
+    let normalized = absolute.canonicalize().unwrap_or(absolute);
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        if let Ok(rest) = normalized.strip_prefix(&home_path) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display());
+        }
+    }
+
+    normalized.display().to_string()
+}
+
 fn request_context(
     uri: &Uri,
     headers: &HeaderMap,
@@ -2063,25 +2178,6 @@ fn normalize_domain(input: &str) -> String {
         }
     }
     input.trim().to_string()
-}
-
-fn json_str(value: Option<&String>, default: &str) -> Value {
-    Value::String(value.cloned().unwrap_or_else(|| default.to_string()))
-}
-
-fn json_num(value: Option<&String>, default: i64) -> Value {
-    Value::Number(
-        value
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(default)
-            .into(),
-    )
-}
-
-fn json_float(value: Option<&String>, default: f64) -> Value {
-    serde_json::Number::from_f64(value.and_then(|v| v.parse::<f64>().ok()).unwrap_or(default))
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::Number(serde_json::Number::from_f64(default).unwrap()))
 }
 
 fn truncate(text: &str, max_len: usize) -> String {

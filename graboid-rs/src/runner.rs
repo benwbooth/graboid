@@ -1315,7 +1315,7 @@ impl JobRunner {
         let destination = if destination_path.trim().is_empty() {
             self.config.download_dir()
         } else {
-            PathBuf::from(destination_path)
+            PathBuf::from(decode_percent_escapes(destination_path.trim()))
         };
         fs::create_dir_all(&destination).await?;
 
@@ -1343,7 +1343,7 @@ impl JobRunner {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "downloaded_file".to_string());
-            let target = destination.join(name);
+            let target = destination.join(sanitize_filename(&decode_percent_escapes(&name)));
 
             match file_operation {
                 "hardlink" => {
@@ -1850,7 +1850,7 @@ fn infer_filename(url: &str, content_disposition: &str) -> String {
             if let Some(rest) = part.strip_prefix("filename=") {
                 let cleaned = rest.trim_matches('"').trim();
                 if !cleaned.is_empty() {
-                    return sanitize_filename(cleaned);
+                    return sanitize_filename(&decode_percent_escapes(cleaned));
                 }
             }
         }
@@ -1866,7 +1866,7 @@ fn infer_filename(url: &str, content_disposition: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download.bin".to_string());
 
-    sanitize_filename(&from_url)
+    sanitize_filename(&decode_percent_escapes(&from_url))
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1876,6 +1876,41 @@ fn sanitize_filename(name: &str) -> String {
             _ => c,
         })
         .collect()
+}
+
+fn decode_percent_escapes(input: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    let mut changed = false;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[idx + 1]), hex(bytes[idx + 2])) {
+                out.push((hi << 4) | lo);
+                idx += 3;
+                changed = true;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+
+    if !changed {
+        return input.to_string();
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2068,7 +2103,8 @@ async fn symlink_file(source: &Path, target: &Path) -> Result<()> {
 mod tests {
     use super::{
         augment_prompt_with_source_context, domain_from_input, extract_file_filter_entries,
-        extract_prompt_keywords, navigation_loop_detected, normalize_navigation_url,
+        extract_prompt_keywords, infer_filename, navigation_loop_detected,
+        normalize_navigation_url,
     };
 
     #[test]
@@ -2168,5 +2204,23 @@ mod tests {
 
         let filters = extract_file_filter_entries(output);
         assert!(filters.is_empty());
+    }
+
+    #[test]
+    fn infer_filename_decodes_percent_encoded_url_segments() {
+        let name = infer_filename(
+            "https://example.com/files/Internet%20Archive%20Pack.zip",
+            "",
+        );
+        assert_eq!(name, "Internet Archive Pack.zip");
+    }
+
+    #[test]
+    fn infer_filename_decodes_percent_encoded_content_disposition() {
+        let name = infer_filename(
+            "https://example.com/files/download",
+            "attachment; filename=\"Super%20Mario%203.nes\"",
+        );
+        assert_eq!(name, "Super Mario 3.nes");
     }
 }

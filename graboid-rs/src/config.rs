@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,22 @@ struct FileConfig {
     aria2_host: Option<String>,
     aria2_port: Option<u16>,
     aria2_secret: Option<String>,
+    source_mode: Option<String>,
+    source_endpoints: Option<Vec<String>>,
+    source_sftp_host: Option<String>,
+    source_sftp_port: Option<u16>,
+    source_sftp_username: Option<String>,
+    source_sftp_password: Option<String>,
+    source_ftp_host: Option<String>,
+    source_ftp_port: Option<u16>,
+    source_ftp_username: Option<String>,
+    source_ftp_password: Option<String>,
+    source_samba_host: Option<String>,
+    source_samba_share: Option<String>,
+    source_samba_username: Option<String>,
+    source_samba_password: Option<String>,
+    local_read_whitelist: Option<Vec<String>>,
+    local_write_whitelist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -63,6 +79,327 @@ struct RootConfig {
     graboid_rs: Option<FileConfig>,
     api: Option<ApiConfig>,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigFieldValue {
+    String(&'static str),
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    StringList(&'static [&'static str]),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FormFieldMode {
+    Text,
+    Checkbox,
+    Lines,
+    Constant,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfigFieldSpec {
+    key: &'static str,
+    value: ConfigFieldValue,
+    form_mode: FormFieldMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedSource {
+    pub name: String,
+    pub kind: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub location: String,
+    pub username: String,
+    pub password: String,
+}
+
+const EMPTY_STRING_LIST: &[&str] = &[];
+
+const CONFIG_FIELD_SPECS: &[ConfigFieldSpec] = &[
+    ConfigFieldSpec {
+        key: "bind_addr",
+        value: ConfigFieldValue::String("0.0.0.0:8000"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "database_path",
+        value: ConfigFieldValue::String("./graboid-rs-data/jobs.db"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "download_dir",
+        value: ConfigFieldValue::String("./downloads"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "download_retry_attempts",
+        value: ConfigFieldValue::Integer(2),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "download_max_parallel",
+        value: ConfigFieldValue::Integer(4),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "download_retry_backoff_sec",
+        value: ConfigFieldValue::Float(2.0),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "download_allow_insecure",
+        value: ConfigFieldValue::Bool(true),
+        form_mode: FormFieldMode::Checkbox,
+    },
+    ConfigFieldSpec {
+        key: "jobs_max_concurrent",
+        value: ConfigFieldValue::Integer(2),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "claude_model",
+        value: ConfigFieldValue::String("sonnet"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "claude_cmd",
+        value: ConfigFieldValue::String("claude"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "api_key",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "chrome_debug_port",
+        value: ConfigFieldValue::Integer(9222),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "headless",
+        value: ConfigFieldValue::Bool(true),
+        form_mode: FormFieldMode::Checkbox,
+    },
+    ConfigFieldSpec {
+        key: "browser_mode",
+        value: ConfigFieldValue::String("chrome"),
+        form_mode: FormFieldMode::Constant,
+    },
+    ConfigFieldSpec {
+        key: "browser_use_mcp_command",
+        value: ConfigFieldValue::String("uvx"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "browser_use_mcp_args",
+        value: ConfigFieldValue::String("browser-use[mcp]"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "claude_timeout_seconds",
+        value: ConfigFieldValue::Integer(900),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "download_timeout_seconds",
+        value: ConfigFieldValue::Integer(180),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "ollama_host",
+        value: ConfigFieldValue::String("http://localhost:11434"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "llm_provider",
+        value: ConfigFieldValue::String("claude_code"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "llm_model",
+        value: ConfigFieldValue::String("sonnet"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "torrent_client",
+        value: ConfigFieldValue::String("embedded"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "qbittorrent_host",
+        value: ConfigFieldValue::String("localhost"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "qbittorrent_port",
+        value: ConfigFieldValue::Integer(8080),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "qbittorrent_username",
+        value: ConfigFieldValue::String("admin"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "qbittorrent_password",
+        value: ConfigFieldValue::String("adminadmin"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "transmission_host",
+        value: ConfigFieldValue::String("localhost"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "transmission_port",
+        value: ConfigFieldValue::Integer(9091),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "transmission_username",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "transmission_password",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "deluge_host",
+        value: ConfigFieldValue::String("localhost"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "deluge_port",
+        value: ConfigFieldValue::Integer(58846),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "deluge_username",
+        value: ConfigFieldValue::String("localclient"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "deluge_password",
+        value: ConfigFieldValue::String("deluge"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "rtorrent_url",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "aria2_host",
+        value: ConfigFieldValue::String("localhost"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "aria2_port",
+        value: ConfigFieldValue::Integer(6800),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "aria2_secret",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_mode",
+        value: ConfigFieldValue::String("web"),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_endpoints",
+        value: ConfigFieldValue::StringList(EMPTY_STRING_LIST),
+        form_mode: FormFieldMode::Lines,
+    },
+    ConfigFieldSpec {
+        key: "source_sftp_host",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_sftp_port",
+        value: ConfigFieldValue::Integer(22),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_sftp_username",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_sftp_password",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_ftp_host",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_ftp_port",
+        value: ConfigFieldValue::Integer(21),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_ftp_username",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_ftp_password",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_samba_host",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_samba_share",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_samba_username",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "source_samba_password",
+        value: ConfigFieldValue::String(""),
+        form_mode: FormFieldMode::Text,
+    },
+    ConfigFieldSpec {
+        key: "path_mappings",
+        value: ConfigFieldValue::StringList(EMPTY_STRING_LIST),
+        form_mode: FormFieldMode::Lines,
+    },
+    ConfigFieldSpec {
+        key: "local_read_whitelist",
+        value: ConfigFieldValue::StringList(EMPTY_STRING_LIST),
+        form_mode: FormFieldMode::Lines,
+    },
+    ConfigFieldSpec {
+        key: "local_write_whitelist",
+        value: ConfigFieldValue::StringList(EMPTY_STRING_LIST),
+        form_mode: FormFieldMode::Lines,
+    },
+    ConfigFieldSpec {
+        key: "log_level",
+        value: ConfigFieldValue::String("INFO"),
+        form_mode: FormFieldMode::Text,
+    },
+];
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -106,6 +443,22 @@ pub struct AppConfig {
     pub aria2_host: String,
     pub aria2_port: u16,
     pub aria2_secret: String,
+    pub source_mode: String,
+    pub source_endpoints: Vec<String>,
+    pub source_sftp_host: String,
+    pub source_sftp_port: u16,
+    pub source_sftp_username: String,
+    pub source_sftp_password: String,
+    pub source_ftp_host: String,
+    pub source_ftp_port: u16,
+    pub source_ftp_username: String,
+    pub source_ftp_password: String,
+    pub source_samba_host: String,
+    pub source_samba_share: String,
+    pub source_samba_username: String,
+    pub source_samba_password: String,
+    pub local_read_whitelist: Vec<String>,
+    pub local_write_whitelist: Vec<String>,
     pub config_path: PathBuf,
 }
 
@@ -155,9 +508,33 @@ impl Default for AppConfig {
             aria2_host: "localhost".to_string(),
             aria2_port: 6800,
             aria2_secret: String::new(),
+            source_mode: "web".to_string(),
+            source_endpoints: Vec::new(),
+            source_sftp_host: String::new(),
+            source_sftp_port: 22,
+            source_sftp_username: String::new(),
+            source_sftp_password: String::new(),
+            source_ftp_host: String::new(),
+            source_ftp_port: 21,
+            source_ftp_username: String::new(),
+            source_ftp_password: String::new(),
+            source_samba_host: String::new(),
+            source_samba_share: String::new(),
+            source_samba_username: String::new(),
+            source_samba_password: String::new(),
+            local_read_whitelist: Vec::new(),
+            local_write_whitelist: Vec::new(),
             config_path: PathBuf::from("config.toml"),
         }
     }
+}
+
+macro_rules! apply_opt_fields {
+    ($target:expr, $source:expr, [$($field:ident),+ $(,)?]) => {
+        $(
+            set_opt(&mut $target.$field, $source.$field);
+        )+
+    };
 }
 
 impl AppConfig {
@@ -197,9 +574,6 @@ impl AppConfig {
     }
 
     fn apply_file(&mut self, file_cfg: FileConfig) {
-        set_opt(&mut self.bind_addr, file_cfg.bind_addr);
-        set_opt(&mut self.database_path, file_cfg.database_path);
-        set_opt(&mut self.download_dir, file_cfg.download_dir);
         set_opt_usize_min(
             &mut self.download_retry_attempts,
             file_cfg.download_retry_attempts,
@@ -215,28 +589,10 @@ impl AppConfig {
             file_cfg.download_retry_backoff_sec,
             0.0,
         );
-        set_opt(
-            &mut self.download_allow_insecure,
-            file_cfg.download_allow_insecure,
-        );
         set_opt_usize_min(
             &mut self.jobs_max_concurrent,
             file_cfg.jobs_max_concurrent,
             1,
-        );
-        set_opt(&mut self.claude_model, file_cfg.claude_model);
-        set_opt(&mut self.claude_cmd, file_cfg.claude_cmd);
-        set_opt(&mut self.api_key, file_cfg.api_key);
-        set_opt(&mut self.chrome_debug_port, file_cfg.chrome_debug_port);
-        set_opt(&mut self.chrome_headless, file_cfg.chrome_headless);
-        set_opt(&mut self.browser_mode, file_cfg.browser_mode);
-        set_opt(
-            &mut self.browser_use_mcp_command,
-            file_cfg.browser_use_mcp_command,
-        );
-        set_opt(
-            &mut self.browser_use_mcp_args,
-            file_cfg.browser_use_mcp_args,
         );
         set_opt_u64_min(
             &mut self.claude_timeout_seconds,
@@ -248,77 +604,62 @@ impl AppConfig {
             file_cfg.download_timeout_seconds,
             10,
         );
-        set_opt(&mut self.ollama_host, file_cfg.ollama_host);
-        set_opt(&mut self.torrent_client, file_cfg.torrent_client);
-        set_opt(&mut self.qbittorrent_host, file_cfg.qbittorrent_host);
-        set_opt(&mut self.qbittorrent_port, file_cfg.qbittorrent_port);
-        set_opt(
-            &mut self.qbittorrent_username,
-            file_cfg.qbittorrent_username,
+        apply_opt_fields!(
+            self,
+            file_cfg,
+            [
+                bind_addr,
+                database_path,
+                download_dir,
+                download_allow_insecure,
+                claude_model,
+                claude_cmd,
+                api_key,
+                chrome_debug_port,
+                chrome_headless,
+                browser_mode,
+                browser_use_mcp_command,
+                browser_use_mcp_args,
+                ollama_host,
+                torrent_client,
+                qbittorrent_host,
+                qbittorrent_port,
+                qbittorrent_username,
+                qbittorrent_password,
+                transmission_host,
+                transmission_port,
+                transmission_username,
+                transmission_password,
+                deluge_host,
+                deluge_port,
+                deluge_username,
+                deluge_password,
+                rtorrent_url,
+                aria2_host,
+                aria2_port,
+                aria2_secret,
+                source_mode,
+                source_endpoints,
+                source_sftp_host,
+                source_sftp_port,
+                source_sftp_username,
+                source_sftp_password,
+                source_ftp_host,
+                source_ftp_port,
+                source_ftp_username,
+                source_ftp_password,
+                source_samba_host,
+                source_samba_share,
+                source_samba_username,
+                source_samba_password,
+                local_read_whitelist,
+                local_write_whitelist
+            ]
         );
-        set_opt(
-            &mut self.qbittorrent_password,
-            file_cfg.qbittorrent_password,
-        );
-        set_opt(&mut self.transmission_host, file_cfg.transmission_host);
-        set_opt(&mut self.transmission_port, file_cfg.transmission_port);
-        set_opt(
-            &mut self.transmission_username,
-            file_cfg.transmission_username,
-        );
-        set_opt(
-            &mut self.transmission_password,
-            file_cfg.transmission_password,
-        );
-        set_opt(&mut self.deluge_host, file_cfg.deluge_host);
-        set_opt(&mut self.deluge_port, file_cfg.deluge_port);
-        set_opt(&mut self.deluge_username, file_cfg.deluge_username);
-        set_opt(&mut self.deluge_password, file_cfg.deluge_password);
-        set_opt(&mut self.rtorrent_url, file_cfg.rtorrent_url);
-        set_opt(&mut self.aria2_host, file_cfg.aria2_host);
-        set_opt(&mut self.aria2_port, file_cfg.aria2_port);
-        set_opt(&mut self.aria2_secret, file_cfg.aria2_secret);
     }
 
     fn apply_env(&mut self) {
-        let env_cfg = FileConfig {
-            bind_addr: env_string("GRABOID_RS_BIND_ADDR"),
-            database_path: env_string("GRABOID_RS_DATABASE_PATH"),
-            download_dir: env_string("GRABOID_RS_DOWNLOAD_DIR"),
-            download_retry_attempts: env_parse("GRABOID_RS_DOWNLOAD_RETRY_ATTEMPTS"),
-            download_max_parallel: env_parse("GRABOID_RS_DOWNLOAD_MAX_PARALLEL"),
-            download_retry_backoff_sec: env_parse("GRABOID_RS_DOWNLOAD_RETRY_BACKOFF_SEC"),
-            download_allow_insecure: env_parse("GRABOID_RS_DOWNLOAD_ALLOW_INSECURE"),
-            jobs_max_concurrent: env_parse("GRABOID_RS_JOBS_MAX_CONCURRENT"),
-            claude_model: env_string("GRABOID_RS_CLAUDE_MODEL"),
-            claude_cmd: env_string("GRABOID_RS_CLAUDE_CMD"),
-            api_key: env_string("GRABOID_RS_API_KEY"),
-            chrome_debug_port: env_parse("GRABOID_RS_CHROME_DEBUG_PORT"),
-            chrome_headless: env_parse("GRABOID_RS_CHROME_HEADLESS"),
-            browser_mode: env_string("GRABOID_RS_BROWSER_MODE"),
-            browser_use_mcp_command: env_string("GRABOID_RS_BROWSER_USE_MCP_COMMAND"),
-            browser_use_mcp_args: env_string("GRABOID_RS_BROWSER_USE_MCP_ARGS"),
-            claude_timeout_seconds: env_parse("GRABOID_RS_CLAUDE_TIMEOUT_SECONDS"),
-            download_timeout_seconds: env_parse("GRABOID_RS_DOWNLOAD_TIMEOUT_SECONDS"),
-            ollama_host: env_string("GRABOID_RS_OLLAMA_HOST"),
-            torrent_client: env_string("GRABOID_RS_TORRENT_CLIENT"),
-            qbittorrent_host: env_string("GRABOID_RS_QBITTORRENT_HOST"),
-            qbittorrent_port: env_parse("GRABOID_RS_QBITTORRENT_PORT"),
-            qbittorrent_username: env_string("GRABOID_RS_QBITTORRENT_USERNAME"),
-            qbittorrent_password: env_string("GRABOID_RS_QBITTORRENT_PASSWORD"),
-            transmission_host: env_string("GRABOID_RS_TRANSMISSION_HOST"),
-            transmission_port: env_parse("GRABOID_RS_TRANSMISSION_PORT"),
-            transmission_username: env_string("GRABOID_RS_TRANSMISSION_USERNAME"),
-            transmission_password: env_string("GRABOID_RS_TRANSMISSION_PASSWORD"),
-            deluge_host: env_string("GRABOID_RS_DELUGE_HOST"),
-            deluge_port: env_parse("GRABOID_RS_DELUGE_PORT"),
-            deluge_username: env_string("GRABOID_RS_DELUGE_USERNAME"),
-            deluge_password: env_string("GRABOID_RS_DELUGE_PASSWORD"),
-            rtorrent_url: env_string("GRABOID_RS_RTORRENT_URL"),
-            aria2_host: env_string("GRABOID_RS_ARIA2_HOST"),
-            aria2_port: env_parse("GRABOID_RS_ARIA2_PORT"),
-            aria2_secret: env_string("GRABOID_RS_ARIA2_SECRET"),
-        };
+        let env_cfg = FileConfig::from_env();
         self.apply_file(env_cfg);
 
         if let Some(v) = env_string("GRABOID_USERNAME") {
@@ -341,6 +682,202 @@ impl AppConfig {
     pub fn download_dir(&self) -> PathBuf {
         PathBuf::from(&self.download_dir)
     }
+
+    pub fn named_sources(&self) -> Vec<NamedSource> {
+        let mut parsed = parse_named_sources(&self.source_endpoints);
+        if parsed.is_empty() {
+            parsed = legacy_named_sources(self);
+        }
+        ensure_unique_named_source_names(parsed)
+    }
+}
+
+pub fn parse_named_source_line(raw: &str) -> Option<NamedSource> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let parts = if trimmed.contains('\t') {
+        trimmed.split('\t').collect::<Vec<_>>()
+    } else if trimmed.contains('|') {
+        trimmed.split('|').collect::<Vec<_>>()
+    } else {
+        return None;
+    };
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let mut fields = parts
+        .into_iter()
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    fields.resize(7, String::new());
+
+    let kind = normalize_named_source_kind(&fields[1])?;
+    let host = fields[2].trim().to_string();
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = fields[3]
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .or_else(|| default_named_source_port(&kind));
+    let name = if fields[0].trim().is_empty() {
+        format!("{kind}-{host}")
+    } else {
+        fields[0].trim().to_string()
+    };
+
+    Some(NamedSource {
+        name,
+        kind,
+        host,
+        port,
+        location: fields[4].trim().to_string(),
+        username: fields[5].trim().to_string(),
+        password: fields[6].to_string(),
+    })
+}
+
+pub fn parse_named_sources(lines: &[String]) -> Vec<NamedSource> {
+    lines
+        .iter()
+        .filter_map(|line| parse_named_source_line(line))
+        .collect::<Vec<_>>()
+}
+
+pub fn encode_named_source_line(source: &NamedSource) -> String {
+    let port = source
+        .port
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    [
+        sanitize_named_source_cell(&source.name),
+        sanitize_named_source_cell(&source.kind),
+        sanitize_named_source_cell(&source.host),
+        sanitize_named_source_cell(&port),
+        sanitize_named_source_cell(&source.location),
+        sanitize_named_source_cell(&source.username),
+        sanitize_named_source_cell(&source.password),
+    ]
+    .join("\t")
+}
+
+fn sanitize_named_source_cell(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ").trim().to_string()
+}
+
+fn normalize_named_source_kind(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let kind = match normalized.as_str() {
+        "sftp" => "sftp",
+        "ftp" => "ftp",
+        "samba" | "smb" => "samba",
+        _ => return None,
+    };
+    Some(kind.to_string())
+}
+
+fn default_named_source_port(kind: &str) -> Option<u16> {
+    match kind {
+        "sftp" => Some(22),
+        "ftp" => Some(21),
+        "samba" => Some(445),
+        _ => None,
+    }
+}
+
+fn legacy_named_sources(cfg: &AppConfig) -> Vec<NamedSource> {
+    let mut sources = Vec::new();
+
+    if !cfg.source_sftp_host.trim().is_empty() {
+        sources.push(NamedSource {
+            name: "default-sftp".to_string(),
+            kind: "sftp".to_string(),
+            host: cfg.source_sftp_host.trim().to_string(),
+            port: Some(cfg.source_sftp_port),
+            location: String::new(),
+            username: cfg.source_sftp_username.clone(),
+            password: cfg.source_sftp_password.clone(),
+        });
+    }
+
+    if !cfg.source_ftp_host.trim().is_empty() {
+        sources.push(NamedSource {
+            name: "default-ftp".to_string(),
+            kind: "ftp".to_string(),
+            host: cfg.source_ftp_host.trim().to_string(),
+            port: Some(cfg.source_ftp_port),
+            location: String::new(),
+            username: cfg.source_ftp_username.clone(),
+            password: cfg.source_ftp_password.clone(),
+        });
+    }
+
+    if !cfg.source_samba_host.trim().is_empty() {
+        sources.push(NamedSource {
+            name: "default-samba".to_string(),
+            kind: "samba".to_string(),
+            host: cfg.source_samba_host.trim().to_string(),
+            port: Some(445),
+            location: cfg.source_samba_share.clone(),
+            username: cfg.source_samba_username.clone(),
+            password: cfg.source_samba_password.clone(),
+        });
+    }
+
+    sources
+}
+
+fn ensure_unique_named_source_names(mut sources: Vec<NamedSource>) -> Vec<NamedSource> {
+    let mut seen = HashSet::new();
+    for source in &mut sources {
+        let base = source.name.trim();
+        let candidate = if base.is_empty() {
+            format!("{}-{}", source.kind, source.host)
+        } else {
+            base.to_string()
+        };
+
+        if seen.insert(candidate.to_ascii_lowercase()) {
+            source.name = candidate;
+            continue;
+        }
+
+        let mut suffix = 2usize;
+        loop {
+            let suffixed = format!("{candidate}-{suffix}");
+            if seen.insert(suffixed.to_ascii_lowercase()) {
+                source.name = suffixed;
+                break;
+            }
+            suffix += 1;
+        }
+    }
+
+    sources
+}
+
+impl FileConfig {
+    fn from_env() -> Self {
+        let mut values = JsonMap::new();
+        for spec in CONFIG_FIELD_SPECS {
+            let Some(raw) = read_env_for_key(spec.key) else {
+                continue;
+            };
+            let Some(parsed) = parse_raw_to_json(&raw, spec.value) else {
+                continue;
+            };
+            values.insert(spec.key.to_string(), parsed);
+        }
+
+        serde_json::from_value::<FileConfig>(JsonValue::Object(values)).unwrap_or_default()
+    }
 }
 
 pub fn config_search_paths() -> Vec<PathBuf> {
@@ -361,6 +898,40 @@ pub fn load_config_flat_json(path: &Path) -> JsonMap<String, JsonValue> {
         .into_iter()
         .map(|(k, v)| (k, toml_to_json(v)))
         .collect::<JsonMap<_, _>>()
+}
+
+pub fn build_flat_config_from_form(form: &HashMap<String, String>) -> BTreeMap<String, JsonValue> {
+    let mut flat = BTreeMap::new();
+
+    for spec in CONFIG_FIELD_SPECS {
+        let value = match spec.form_mode {
+            FormFieldMode::Skip => continue,
+            FormFieldMode::Constant => default_json_value(spec.value),
+            FormFieldMode::Checkbox => JsonValue::Bool(form.contains_key(spec.key)),
+            FormFieldMode::Lines => JsonValue::Array(
+                parse_list_lines(form.get(spec.key).map(String::as_str))
+                    .into_iter()
+                    .map(JsonValue::String)
+                    .collect::<Vec<_>>(),
+            ),
+            FormFieldMode::Text => form
+                .get(spec.key)
+                .and_then(|raw| parse_raw_to_json(raw, spec.value))
+                .unwrap_or_else(|| default_json_value(spec.value)),
+        };
+
+        flat.insert(spec.key.to_string(), value);
+    }
+
+    let claude_model = form
+        .get("llm_model")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("sonnet")
+        .to_string();
+    flat.insert("claude_model".to_string(), JsonValue::String(claude_model));
+
+    flat
 }
 
 pub fn persist_flat_config(path: &Path, flat: &BTreeMap<String, JsonValue>) -> Result<()> {
@@ -437,11 +1008,97 @@ fn env_string(key: &str) -> Option<String> {
     env::var(key).ok()
 }
 
-fn env_parse<T>(key: &str) -> Option<T>
-where
-    T: std::str::FromStr,
-{
-    env::var(key).ok().and_then(|v| v.parse::<T>().ok())
+fn read_env_for_key(key: &str) -> Option<String> {
+    let suffix = env_suffix_for_key(key);
+    let primary = format!("GRABOID_{suffix}");
+    if let Ok(value) = env::var(&primary) {
+        return Some(value);
+    }
+
+    let legacy = format!("GRABOID_RS_{suffix}");
+    env::var(&legacy).ok()
+}
+
+fn env_suffix_for_key(key: &str) -> String {
+    key.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+}
+
+fn parse_bool_text(raw: &str) -> Option<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_list_lines(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .lines()
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default()
+}
+
+fn parse_list_env(raw: &str) -> Vec<String> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+}
+
+fn parse_raw_to_json(raw: &str, field_type: ConfigFieldValue) -> Option<JsonValue> {
+    match field_type {
+        ConfigFieldValue::String(_) => Some(JsonValue::String(raw.to_string())),
+        ConfigFieldValue::Integer(_) => raw
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|value| JsonValue::Number(value.into())),
+        ConfigFieldValue::Float(_) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(JsonValue::Number),
+        ConfigFieldValue::Bool(_) => parse_bool_text(raw).map(JsonValue::Bool),
+        ConfigFieldValue::StringList(_) => Some(JsonValue::Array(
+            parse_list_env(raw)
+                .into_iter()
+                .map(JsonValue::String)
+                .collect::<Vec<_>>(),
+        )),
+    }
+}
+
+fn default_json_value(field_type: ConfigFieldValue) -> JsonValue {
+    match field_type {
+        ConfigFieldValue::String(value) => JsonValue::String(value.to_string()),
+        ConfigFieldValue::Integer(value) => JsonValue::Number(value.into()),
+        ConfigFieldValue::Float(value) => serde_json::Number::from_f64(value)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        ConfigFieldValue::Bool(value) => JsonValue::Bool(value),
+        ConfigFieldValue::StringList(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(|value| JsonValue::String((*value).to_string()))
+                .collect::<Vec<_>>(),
+        ),
+    }
 }
 
 fn set_opt<T>(dst: &mut T, value: Option<T>) {
