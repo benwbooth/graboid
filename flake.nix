@@ -68,6 +68,9 @@
             zlib
           ];
 
+          # Keep flake inputs in closure so GC doesn't collect them
+          FLAKE_INPUTS = builtins.concatStringsSep ":" [ "${nixpkgs}" "${flake-utils}" ];
+
           RUST_LOG = "info";
           GRABOID_RS_BIND_ADDR = "127.0.0.1:8000";
         };
