@@ -18,21 +18,31 @@ pub struct LocalPathPolicy {
 impl LocalPathPolicy {
     pub fn from_config(cfg: &AppConfig) -> Self {
         let default_root = normalize_absolute_path(&cfg.download_dir());
-        let read_roots = build_roots(
+        Self::from_whitelists(
             &cfg.local_read_whitelist,
-            Some(default_root.clone()),
-            AccessKind::Read,
-        );
-        let write_roots = build_roots(
             &cfg.local_write_whitelist,
+            Some(default_root.clone()),
             Some(default_root),
-            AccessKind::Write,
-        );
+        )
+    }
+
+    pub fn from_whitelists(
+        read_whitelist: &[String],
+        write_whitelist: &[String],
+        read_fallback: Option<PathBuf>,
+        write_fallback: Option<PathBuf>,
+    ) -> Self {
+        let read_roots = build_roots(read_whitelist, read_fallback, AccessKind::Read);
+        let write_roots = build_roots(write_whitelist, write_fallback, AccessKind::Write);
 
         Self {
             read_roots,
             write_roots,
         }
+    }
+
+    pub fn from_allowlists(read_whitelist: &[String], write_whitelist: &[String]) -> Self {
+        Self::from_whitelists(read_whitelist, write_whitelist, None, None)
     }
 
     pub fn write_roots(&self) -> &[PathBuf] {

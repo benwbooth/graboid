@@ -169,9 +169,10 @@ async fn index_page(
         return Ok(Redirect::to("/login").into_response());
     }
     let runtime = runtime_badge(&state).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
 
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_index_page(&request, &state.git_info, &runtime);
+    let page = ui::render_index_page(&request, &git_info, &runtime);
     Ok(Html(page).into_response())
 }
 
@@ -188,14 +189,17 @@ async fn config_page(
 
     let config_map = load_config_flat_json(&state.config_path);
     let runtime = runtime_badge(&state).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     let request = request_context(&uri, &headers, &query);
     let config_path_display = display_config_path(&state.config_path);
+    let api_key = state.api_key.read().await.clone();
     let page = ui::render_config_page(
         &request,
-        &state.git_info,
+        &git_info,
         &runtime,
         &config_map,
         &config_path_display,
+        &api_key,
     );
     Ok(Html(page).into_response())
 }
@@ -348,10 +352,11 @@ async fn notes_page(
     }
 
     let runtime = runtime_badge(&state).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     let request = request_context(&uri, &headers, &query);
     let page = ui::render_notes_page(
         &request,
-        &state.git_info,
+        &git_info,
         &runtime,
         &stats,
         &domains,
@@ -373,8 +378,9 @@ async fn browser_page(
     let runtime = runtime_badge(&state).await;
     let screenshot = state.runtime.screenshot().await;
     let messages = state.runtime.messages_tail(120).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     let request = request_context(&uri, &headers, &query);
-    let page = ui::render_browser_page(&request, &state.git_info, &runtime, screenshot, &messages);
+    let page = ui::render_browser_page(&request, &git_info, &runtime, screenshot, &messages);
     Ok(Html(page).into_response())
 }
 
@@ -404,10 +410,11 @@ async fn jobs_page(
     let total = state.db.count_jobs(None).await?;
     let api_key = state.api_key.read().await.clone();
     let runtime = runtime_badge(&state).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     let request = request_context(&uri, &headers, &query);
     let page = ui::render_jobs_page(
         &request,
-        &state.git_info,
+        &git_info,
         &runtime,
         &api_key,
         &jobs,
@@ -439,17 +446,11 @@ async fn job_detail_page(
     let logs = state.db.list_logs(&job_id, 500).await?;
     let api_key = state.api_key.read().await.clone();
     let runtime = runtime_badge(&state).await;
+    let git_info = crate::state::GitInfo::capture(&state.project_root);
     let request = request_context(&uri, &headers, &query);
 
-    let page = ui::render_job_detail_page(
-        &request,
-        &state.git_info,
-        &runtime,
-        &api_key,
-        &job,
-        &steps,
-        &logs,
-    );
+    let page =
+        ui::render_job_detail_page(&request, &git_info, &runtime, &api_key, &job, &steps, &logs);
     Ok(Html(page).into_response())
 }
 
@@ -590,6 +591,8 @@ async fn submit_job_form(
         destination_path,
         file_operation,
         priority,
+        local_read_whitelist: Vec::new(),
+        local_write_whitelist: Vec::new(),
         metadata: Value::Object(Default::default()),
     };
 
@@ -639,6 +642,8 @@ async fn requeue_job_form(
         destination_path: original.destination_path,
         file_operation: original.file_operation,
         priority: original.priority,
+        local_read_whitelist: Vec::new(),
+        local_write_whitelist: Vec::new(),
         metadata: original.metadata,
     };
 
@@ -1753,6 +1758,8 @@ fn build_openapi_spec() -> Value {
               "destination_path": { "type": "string", "default": "" },
               "file_operation": { "type": "string", "default": "copy" },
               "priority": { "type": "integer", "default": 0 },
+              "local_read_whitelist": { "type": "array", "items": { "type": "string" }, "default": [] },
+              "local_write_whitelist": { "type": "array", "items": { "type": "string" }, "default": [] },
               "metadata": { "type": "object", "additionalProperties": true, "default": {} }
             }
           },

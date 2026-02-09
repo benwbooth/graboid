@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
-use js_sys::Date;
+use js_sys::{Date, Function, Reflect};
 use leptos::*;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -12,7 +12,7 @@ use serde_json::Value;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen_futures::spawn_local;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     Document, EventSource, HtmlButtonElement, HtmlElement, HtmlFormElement, HtmlImageElement,
     HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement, MessageEvent,
@@ -132,6 +132,11 @@ struct TorrentTestResponse {
 struct ApiErrorResponse {
     error: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiKeyRegenerateResponse {
+    api_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1487,6 +1492,92 @@ fn set_config_save_status(text: &str, class_name: &str) {
     set_class("config-save-status", class_name);
 }
 
+fn config_page_api_key() -> String {
+    let Some(doc) = web_document() else {
+        return String::new();
+    };
+    doc.get_element_by_id("graboid-api-key-value")
+        .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+        .map(|input| input.value())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn set_api_key_regen_status(text: &str, class_name: &str) {
+    set_text("api-key-regen-status", text);
+    set_class("api-key-regen-status", class_name);
+}
+
+fn set_config_page_api_key(value: &str) {
+    let Some(doc) = web_document() else {
+        return;
+    };
+    let Some(input) = doc
+        .get_element_by_id("graboid-api-key-value")
+        .and_then(|node| node.dyn_into::<HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    if input.value() == value {
+        return;
+    }
+    input.set_value(value);
+}
+
+fn copy_text_via_fallback_clipboard_api(text: &str) -> Result<(), String> {
+    let Some(doc) = web_document() else {
+        return Err("Missing document".to_string());
+    };
+    let Some(body) = doc.body() else {
+        return Err("Missing document body".to_string());
+    };
+
+    let Ok(node) = doc.create_element("textarea") else {
+        return Err("Failed to create clipboard helper".to_string());
+    };
+    let Ok(textarea) = node.dyn_into::<HtmlTextAreaElement>() else {
+        return Err("Failed to prepare clipboard helper".to_string());
+    };
+    textarea.set_value(text);
+    let _ = textarea.set_attribute("readonly", "readonly");
+    let _ = textarea.set_attribute(
+        "style",
+        "position: fixed; left: -9999px; top: 0; opacity: 0; pointer-events: none;",
+    );
+    let _ = body.append_child(&textarea);
+    let _ = textarea.focus();
+    textarea.select();
+    let exec = Reflect::get(doc.as_ref(), &JsValue::from_str("execCommand"))
+        .map_err(|_| "Clipboard helper unavailable".to_string())?;
+    let copied = if let Ok(func) = exec.dyn_into::<Function>() {
+        func.call1(doc.as_ref(), &JsValue::from_str("copy"))
+            .ok()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let _ = body.remove_child(&textarea);
+
+    if copied {
+        Ok(())
+    } else {
+        Err("Clipboard access denied".to_string())
+    }
+}
+
+async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
+    if let Some(window) = web_sys::window() {
+        let clipboard = window.navigator().clipboard();
+        if JsFuture::from(clipboard.write_text(&text)).await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    copy_text_via_fallback_clipboard_api(&text)
+}
+
 fn set_password_toggle_state(button: &HtmlButtonElement, revealed: bool) {
     button.set_text_content(Some("👁"));
     let label = if revealed {
@@ -2725,6 +2816,7 @@ fn init_config_live_form() {
     init_password_reveal_inputs();
     refresh_model_suggestions_from_dom();
     set_config_save_status("Auto-save enabled", "tag");
+    set_api_key_regen_status("Ready", "config-inline-status");
 
     let autosave_debounce = Rc::new(RefCell::new(None::<Timeout>));
 
@@ -2994,6 +3086,96 @@ fn init_config_live_form() {
                     set_text("torznab-test-result", "Unexpected response");
                     set_class("torznab-test-result", "config-inline-status error");
                 }
+            });
+        });
+        let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(button) = doc
+        .get_element_by_id("config-api-key-copy")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let api_key = config_page_api_key();
+            if api_key.is_empty() {
+                set_api_key_regen_status("Missing API key", "config-inline-status error");
+                return;
+            }
+            set_api_key_regen_status("Copying...", "config-inline-status");
+            spawn_local(async move {
+                match copy_text_to_clipboard(api_key).await {
+                    Ok(()) => set_api_key_regen_status("Copied", "config-inline-status success"),
+                    Err(err) => set_api_key_regen_status(
+                        &format!("Copy failed: {err}"),
+                        "config-inline-status error",
+                    ),
+                }
+            });
+        });
+        let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());
+        callback.forget();
+    }
+
+    if let Some(button) = doc
+        .get_element_by_id("config-api-key-regenerate")
+        .and_then(|node| node.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            event.prevent_default();
+            let current_key = config_page_api_key();
+            if current_key.is_empty() {
+                set_api_key_regen_status("Missing current API key", "config-inline-status error");
+                return;
+            }
+
+            set_api_key_regen_status("Regenerating...", "config-inline-status");
+            spawn_local(async move {
+                let request = Request::post("/api/v1/key/regenerate")
+                    .header("X-API-Key", &current_key)
+                    .body(String::new());
+                let Ok(request) = request else {
+                    set_api_key_regen_status("Request error", "config-inline-status error");
+                    return;
+                };
+
+                let Ok(response) = request.send().await else {
+                    set_api_key_regen_status("Connection failed", "config-inline-status error");
+                    return;
+                };
+
+                if response.ok() {
+                    let payload = response.json::<ApiKeyRegenerateResponse>().await.ok();
+                    if let Some(payload) = payload {
+                        if payload.api_key.trim().is_empty() {
+                            set_api_key_regen_status(
+                                "Empty API key returned",
+                                "config-inline-status error",
+                            );
+                            return;
+                        }
+                        set_config_page_api_key(&payload.api_key);
+                        set_api_key_regen_status(
+                            "API key regenerated",
+                            "config-inline-status success",
+                        );
+                    } else {
+                        set_api_key_regen_status(
+                            "Unexpected response",
+                            "config-inline-status error",
+                        );
+                    }
+                    return;
+                }
+
+                let status = response.status();
+                let payload = response.json::<ApiErrorResponse>().await.ok();
+                let message = payload
+                    .and_then(|body| body.detail.or(body.error))
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| format!("Regenerate failed: HTTP {status}"));
+                set_api_key_regen_status(&message, "config-inline-status error");
             });
         });
         let _ = button.add_event_listener_with_callback("click", callback.as_ref().unchecked_ref());

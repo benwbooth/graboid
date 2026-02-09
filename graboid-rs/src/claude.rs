@@ -1126,6 +1126,14 @@ fn map_tool_to_step(tool_name: &str, input: &Value) -> (String, String, String) 
         );
     }
 
+    if name.contains("web_search_links") {
+        return (
+            "Web Link Search".to_string(),
+            format!("Search page links via API ({input_text})"),
+            String::new(),
+        );
+    }
+
     if name.contains("torrent_add") {
         return (
             "Torrent Add".to_string(),
@@ -1329,6 +1337,7 @@ fn build_prompt(
         render_local_filesystem_policy(&cfg.local_read_whitelist, &cfg.local_write_whitelist);
     let graboid_tooling_block = "GRABOID MCP TOOLS:\n\
          - `torznab_search(query, fresh?, max_results?)`: Search configured Torznab endpoint.\n\
+         - `web_search_links(url, query?, match_mode?, offset?, limit?, max_fetch_bytes?)`: Fetch and search links from large HTML pages.\n\
          - `torrent_add(source, client?)`: Queue a torrent/magnet through configured client APIs.\n\
          - `torrent_selective_fetch(source, prompt, file_filter[])`: Selective embedded torrent fetch when available.\n\
          - `source_catalog()`: List named remote sources and local allowlists.\n\
@@ -1395,8 +1404,7 @@ fn build_prompt(
          - Emit `[DOWNLOAD]` only for links that clearly match the requested target; if relevance is unclear, gather more evidence before selecting.\n\
          - For torrent/indexer tasks, use Graboid MCP tools (`torznab_search`, `torrent_add`) instead of browsing Torznab/Jackett web UI.\n\
          - For local/SFTP/FTP/Samba source tasks, use Graboid MCP source tools (`source_catalog`, `source_list_dir`, `source_read_text`, `source_copy_to_downloads`) rather than website UI navigation.\n\
-         - Use targeted page search with evaluate_script (querySelectorAll on links/buttons) before broad snapshots.\n\
-         - On long directory pages, do one evaluate_script pass that extracts all anchor href/text pairs and filter in-script by task keywords.\n\
+         - For large index/listing pages, use `web_search_links` to inspect/filter links quickly before extra browser clicks.\n\
          - Do not loop between homepage and the same directory. Stay in the deepest relevant page until links are extracted.\n\
          - Never navigate to about:blank again after the first real page load unless recovery is required.\n\
          - Avoid repeated identical tool calls; if one approach fails, switch strategy immediately.\n\

@@ -26,7 +26,7 @@ use crate::config::AppConfig;
 use crate::db::JobDb;
 use crate::events::ServerEvent;
 use crate::runner::JobRunner;
-use crate::state::{AppState, AuthConfig, GitInfo, RuntimeState};
+use crate::state::{AppState, AuthConfig, RuntimeState};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,7 +61,6 @@ async fn main() -> Result<()> {
     }
 
     let project_root = resolve_project_root();
-    let git_info = GitInfo::capture(&project_root);
     let state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -69,7 +68,6 @@ async fn main() -> Result<()> {
         events: events_tx,
         runtime,
         project_root: project_root.clone(),
-        git_info,
         auth: AuthConfig {
             username: config.username.clone(),
             password: config.password.clone(),

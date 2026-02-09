@@ -22,7 +22,6 @@ pub struct AppState {
     pub events: broadcast::Sender<ServerEvent>,
     pub runtime: Arc<RuntimeState>,
     pub project_root: PathBuf,
-    pub git_info: GitInfo,
     pub auth: AuthConfig,
     pub config_path: PathBuf,
     pub api_key: Arc<RwLock<String>>,

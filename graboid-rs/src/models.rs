@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub const JOB_METADATA_LOCAL_READ_WHITELIST_KEY: &str = "_graboid_job_local_read_whitelist";
+pub const JOB_METADATA_LOCAL_WRITE_WHITELIST_KEY: &str = "_graboid_job_local_write_whitelist";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -124,26 +127,51 @@ pub struct Job {
 
 impl Job {
     pub fn new(req: CreateJobRequest, default_destination: &str) -> Self {
+        let CreateJobRequest {
+            prompt,
+            source_url,
+            credential_name,
+            file_filter,
+            destination_path,
+            file_operation,
+            priority,
+            metadata,
+            local_read_whitelist,
+            local_write_whitelist,
+        } = req;
+
+        let mut metadata = metadata;
+        store_job_path_whitelist(
+            &mut metadata,
+            JOB_METADATA_LOCAL_READ_WHITELIST_KEY,
+            local_read_whitelist,
+        );
+        store_job_path_whitelist(
+            &mut metadata,
+            JOB_METADATA_LOCAL_WRITE_WHITELIST_KEY,
+            local_write_whitelist,
+        );
+
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
             created_at: now,
             updated_at: now,
-            prompt: req.prompt,
-            source_url: req.source_url,
-            credential_name: req.credential_name,
-            file_filter: req.file_filter,
-            destination_path: if req.destination_path.trim().is_empty() {
+            prompt,
+            source_url,
+            credential_name,
+            file_filter,
+            destination_path: if destination_path.trim().is_empty() {
                 default_destination.to_string()
             } else {
-                req.destination_path
+                destination_path
             },
-            file_operation: if req.file_operation.trim().is_empty() {
+            file_operation: if file_operation.trim().is_empty() {
                 "copy".to_string()
             } else {
-                req.file_operation
+                file_operation
             },
-            priority: req.priority,
+            priority,
             status: JobStatus::Pending,
             current_phase: JobPhase::Init,
             progress_percent: 0.0,
@@ -152,7 +180,7 @@ impl Job {
             downloaded_files: Vec::new(),
             final_paths: Vec::new(),
             error_message: String::new(),
-            metadata: req.metadata,
+            metadata,
         }
     }
 
@@ -182,6 +210,14 @@ impl Job {
         self.set_progress(self.progress_percent.max(1.0), "Failed");
         self.error_message = message.into();
     }
+
+    pub fn local_read_whitelist(&self) -> Vec<String> {
+        metadata_string_array(&self.metadata, JOB_METADATA_LOCAL_READ_WHITELIST_KEY)
+    }
+
+    pub fn local_write_whitelist(&self) -> Vec<String> {
+        metadata_string_array(&self.metadata, JOB_METADATA_LOCAL_WRITE_WHITELIST_KEY)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +235,10 @@ pub struct CreateJobRequest {
     pub file_operation: String,
     #[serde(default)]
     pub priority: i32,
+    #[serde(default)]
+    pub local_read_whitelist: Vec<String>,
+    #[serde(default)]
+    pub local_write_whitelist: Vec<String>,
     #[serde(default = "default_metadata")]
     pub metadata: Value,
 }
@@ -209,6 +249,55 @@ fn default_file_operation() -> String {
 
 fn default_metadata() -> Value {
     Value::Object(Default::default())
+}
+
+fn store_job_path_whitelist(metadata: &mut Value, key: &str, values: Vec<String>) {
+    if values.is_empty() {
+        return;
+    }
+
+    let mut deduped = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if deduped.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        deduped.push(trimmed.to_string());
+    }
+
+    if deduped.is_empty() {
+        return;
+    }
+
+    if !metadata.is_object() {
+        *metadata = Value::Object(Default::default());
+    }
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        key.to_string(),
+        Value::Array(deduped.into_iter().map(Value::String).collect()),
+    );
+}
+
+fn metadata_string_array(metadata: &Value, key: &str) -> Vec<String> {
+    metadata
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,4 +384,73 @@ pub struct JobListResponse {
     pub total: i64,
     pub offset: i64,
     pub limit: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CreateJobRequest, JOB_METADATA_LOCAL_READ_WHITELIST_KEY,
+        JOB_METADATA_LOCAL_WRITE_WHITELIST_KEY, Job,
+    };
+    use serde_json::{Value, json};
+
+    #[test]
+    fn job_new_persists_job_local_whitelist_metadata() {
+        let request = CreateJobRequest {
+            prompt: "test".to_string(),
+            source_url: String::new(),
+            credential_name: None,
+            file_filter: Vec::new(),
+            destination_path: String::new(),
+            file_operation: "copy".to_string(),
+            priority: 0,
+            local_read_whitelist: vec![
+                "/tmp/read".to_string(),
+                " /tmp/read ".to_string(),
+                String::new(),
+            ],
+            local_write_whitelist: vec!["./downloads".to_string()],
+            metadata: Value::Object(Default::default()),
+        };
+
+        let job = Job::new(request, "./downloads");
+
+        assert_eq!(job.local_read_whitelist(), vec!["/tmp/read".to_string()]);
+        assert_eq!(job.local_write_whitelist(), vec!["./downloads".to_string()]);
+        assert!(
+            job.metadata
+                .get(JOB_METADATA_LOCAL_READ_WHITELIST_KEY)
+                .is_some()
+        );
+        assert!(
+            job.metadata
+                .get(JOB_METADATA_LOCAL_WRITE_WHITELIST_KEY)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn job_new_keeps_metadata_unchanged_without_job_whitelist() {
+        let request = CreateJobRequest {
+            prompt: "test".to_string(),
+            source_url: String::new(),
+            credential_name: None,
+            file_filter: Vec::new(),
+            destination_path: String::new(),
+            file_operation: "copy".to_string(),
+            priority: 0,
+            local_read_whitelist: Vec::new(),
+            local_write_whitelist: Vec::new(),
+            metadata: json!({"custom": "value"}),
+        };
+
+        let job = Job::new(request, "./downloads");
+
+        assert_eq!(job.local_read_whitelist(), Vec::<String>::new());
+        assert_eq!(job.local_write_whitelist(), Vec::<String>::new());
+        assert_eq!(
+            job.metadata.get("custom"),
+            Some(&Value::String("value".to_string()))
+        );
+    }
 }

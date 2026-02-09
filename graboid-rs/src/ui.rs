@@ -10,64 +10,6 @@ use crate::state::{AgentMessage, GitInfo};
 
 const BASE_CSS: &str = include_str!("ui_assets/base.css");
 const LOGIN_CSS: &str = include_str!("ui_assets/login.css");
-const AUTO_RELOAD_SCRIPT: &str = r#"(function () {
-  const version = document.getElementById("build-version");
-  if (!version) return;
-
-  let inflight = false;
-
-  function readCurrent() {
-    return {
-      beHash: version.getAttribute("data-backend-hash") || "",
-      beEpoch: version.getAttribute("data-backend-epoch") || "",
-      feHash: version.getAttribute("data-frontend-hash") || "",
-      feEpoch: version.getAttribute("data-frontend-epoch") || "",
-    };
-  }
-
-  let baseline = readCurrent();
-
-  function changed(before, after) {
-    return Boolean(before) && before !== after;
-  }
-
-  async function poll() {
-    if (inflight) return;
-    inflight = true;
-    try {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (!response.ok) return;
-
-      const data = await response.json();
-      const backend = (data && data.git && data.git.backend) || {};
-      const frontend = (data && data.git && data.git.frontend) || {};
-      const next = {
-        beHash: String(backend.hash ?? ""),
-        beEpoch: String(backend.epoch ?? ""),
-        feHash: String(frontend.hash ?? ""),
-        feEpoch: String(frontend.epoch ?? ""),
-      };
-
-      const backendChanged =
-        changed(baseline.beHash, next.beHash) ||
-        changed(baseline.beEpoch, next.beEpoch);
-      const frontendChanged =
-        changed(baseline.feHash, next.feHash) ||
-        changed(baseline.feEpoch, next.feEpoch);
-
-      if (backendChanged || frontendChanged) {
-        window.location.reload();
-      }
-    } catch (_err) {
-      // Ignore transient network failures during restarts.
-    } finally {
-      inflight = false;
-      baseline = readCurrent();
-    }
-  }
-
-  window.setInterval(poll, 2000);
-})();"#;
 
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -180,6 +122,7 @@ pub fn render_config_page(
     runtime: &RuntimeBadge,
     config: &serde_json::Map<String, Value>,
     config_path: &str,
+    api_key: &str,
 ) -> String {
     let saved = request
         .query_params
@@ -187,7 +130,7 @@ pub fn render_config_page(
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
 
-    let content = render_config_content(config, config_path, saved);
+    let content = render_config_content(config, config_path, api_key, saved);
     render_app_page(request, git, runtime, "Configuration - Graboid", content)
 }
 
@@ -819,17 +762,20 @@ fn render_document(
     let runtime = create_runtime();
     let module_script = script_src.as_ref().map(|src| {
         let loader = format!(
-            "import init from '{}'; init().catch((err) => console.error('graboid frontend init failed', err));",
+            "const __graboidSrc = '{}';\n\
+             import(__graboidSrc)\n\
+               .then((mod) => {{\n\
+                 const init = mod.default;\n\
+                 const srcUrl = new URL(__graboidSrc, window.location.origin);\n\
+                 const wasmUrl = new URL(srcUrl.pathname.replace(/\\.js$/, '_bg.wasm'), srcUrl.origin);\n\
+                 wasmUrl.search = srcUrl.search;\n\
+                 return init({{ module_or_path: wasmUrl.href }});\n\
+               }})\n\
+               .catch((err) => console.error('graboid frontend init failed', err));",
             src
         );
         view! {
             <script type="module" inner_html=loader></script>
-        }
-        .into_view()
-    });
-    let reload_script = script_src.as_ref().map(|_| {
-        view! {
-            <script>{AUTO_RELOAD_SCRIPT}</script>
         }
         .into_view()
     });
@@ -844,7 +790,6 @@ fn render_document(
             </head>
             <body>
                 {body}
-                {reload_script}
                 {module_script}
             </body>
         </html>
@@ -1308,6 +1253,7 @@ fn render_job_row(job: &Job) -> View {
 fn render_config_content(
     config: &serde_json::Map<String, Value>,
     config_path: &str,
+    api_key: &str,
     saved: bool,
 ) -> View {
     let torrent_client = cfg_string(config, "torrent_client", "embedded");
@@ -1616,6 +1562,36 @@ fn render_config_content(
                         <code>{config_path.to_string()}</code>
                     </div>
                     <span id="config-save-status" class="tag">"Auto-save enabled"</span>
+                </div>
+                <div style="margin-top: 0.8rem; display: flex; justify-content: space-between; align-items: flex-start; gap: 0.8rem; flex-wrap: wrap;">
+                    <div style="min-width: 22rem; flex: 1 1 24rem;">
+                        <span style="color: var(--text-dim);">"Graboid API key: "</span>
+                        <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.25rem; flex-wrap: wrap;">
+                            <input
+                                type="text"
+                                id="graboid-api-key-value"
+                                readonly
+                                size="68"
+                                value=api_key.to_string()
+                                style="width: 68ch; max-width: 100%; flex: 0 1 auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem;"
+                            />
+                            <button
+                                type="button"
+                                class="secondary"
+                                id="config-api-key-copy"
+                                aria-label="Copy API key"
+                                title="Copy API key"
+                            >
+                                "⧉"
+                            </button>
+                            <button type="button" class="secondary" id="config-api-key-regenerate">
+                                "Regenerate"
+                            </button>
+                        </div>
+                        <span id="api-key-regen-status" class="config-inline-status" style="display: inline-block; margin-top: 0.45rem;">
+                            "Ready"
+                        </span>
+                    </div>
                 </div>
             </div>
 
@@ -2288,7 +2264,14 @@ mod tests {
             .insert("saved".to_string(), "1".to_string());
 
         let config = serde_json::Map::new();
-        let html = render_config_page(&req, &git(), &runtime(), &config, "/tmp/config.toml");
+        let html = render_config_page(
+            &req,
+            &git(),
+            &runtime(),
+            &config,
+            "/tmp/config.toml",
+            "test-api-key",
+        );
         assert!(!html.contains("{%"));
         assert!(!html.contains("{{"));
         assert!(html.contains("Configuration saved. Auto-save is now active."));
@@ -2314,7 +2297,14 @@ mod tests {
             )]),
         );
 
-        let html = render_config_page(&req, &git(), &runtime(), &config, "/tmp/config.toml");
+        let html = render_config_page(
+            &req,
+            &git(),
+            &runtime(),
+            &config,
+            "/tmp/config.toml",
+            "test-api-key",
+        );
         assert!(html.contains("value=\"deluge\""));
         assert!(html.contains("&#x2F;a:&#x2F;b") || html.contains("/a:/b"));
         assert!(html.contains("source-endpoint-name"));
@@ -2359,6 +2349,8 @@ mod tests {
             destination_path: "./downloads".to_string(),
             file_operation: "copy".to_string(),
             priority: 0,
+            local_read_whitelist: Vec::new(),
+            local_write_whitelist: Vec::new(),
             metadata: Value::Object(Default::default()),
         };
         let job = Job::new(req, "./downloads");
@@ -2386,6 +2378,8 @@ mod tests {
             destination_path: "./downloads".to_string(),
             file_operation: "copy".to_string(),
             priority: 0,
+            local_read_whitelist: Vec::new(),
+            local_write_whitelist: Vec::new(),
             metadata: Value::Object(Default::default()),
         };
         let job = Job::new(req, "./downloads");

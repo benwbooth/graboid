@@ -56,9 +56,14 @@ Most API errors return:
   "destination_path": "string",
   "file_operation": "copy",
   "priority": 0,
+  "local_read_whitelist": ["/abs/read/path", "./relative/read/path"],
+  "local_write_whitelist": ["/abs/write/path", "./relative/write/path"],
   "metadata": {}
 }
 ```
+
+`local_read_whitelist` and `local_write_whitelist` are optional per-job allowlist overrides.
+When provided, they are merged with global config allowlists for that job only.
 
 ### Job
 

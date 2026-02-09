@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 #[cfg(any(
     feature = "remote-ftp",
@@ -8,10 +9,10 @@ use std::io::Read;
 #[cfg(feature = "remote-sftp")]
 use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
-#[cfg(feature = "remote-sftp")]
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use regex::Regex;
 use serde_json::{Value, json};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
@@ -166,6 +167,27 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "web_search_links",
+            "description": "Fetch an HTML page and list links, optionally filtered by query terms. Useful for large directory pages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "HTTP/HTTPS page URL to scan." },
+                    "query": { "type": "string", "description": "Optional search text; links are filtered by these terms." },
+                    "match_mode": {
+                        "type": "string",
+                        "enum": ["all", "any"],
+                        "description": "When query has multiple terms, require all or any term match. Default: all."
+                    },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matched links before returning results." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum links to return. Default: 200." },
+                    "max_fetch_bytes": { "type": "integer", "minimum": 4096, "maximum": 4000000, "description": "Maximum HTML bytes to fetch/parse. Default: 2000000." }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "torrent_add",
             "description": "Add a magnet/.torrent/URL to the configured torrent client backend.",
             "inputSchema": {
@@ -305,6 +327,80 @@ async fn handle_tool_call(params: &Value, config_path: Option<&Path>) -> Result<
             });
             Ok(tool_ok_result(
                 &format_torznab_text(query, fresh, &results),
+                structured,
+            ))
+        }
+        "web_search_links" => {
+            let page_url = required_string(&args, "url")?;
+            let query = optional_string(&args, "query")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let match_mode = optional_string(&args, "match_mode")
+                .unwrap_or("all")
+                .to_ascii_lowercase();
+            if match_mode != "all" && match_mode != "any" {
+                return Ok(tool_error_result(
+                    "match_mode must be either `all` or `any`",
+                ));
+            }
+            let offset = optional_u64(&args, "offset").unwrap_or(0) as usize;
+            let limit = optional_u64(&args, "limit")
+                .map(|value| value.clamp(1, 500) as usize)
+                .unwrap_or(200);
+            let max_fetch_bytes = optional_u64(&args, "max_fetch_bytes")
+                .map(|value| value.clamp(4096, 4_000_000) as usize)
+                .unwrap_or(2_000_000);
+
+            let (resolved_url, html, truncated) =
+                fetch_web_page_html(page_url, max_fetch_bytes).await?;
+            let title = extract_html_title(&html);
+            let links = extract_html_links(&resolved_url, &html);
+            let query_terms = tokenize_query_terms(&query);
+            let matched = links
+                .into_iter()
+                .filter(|entry| {
+                    if query_terms.is_empty() {
+                        return true;
+                    }
+                    link_matches_query(entry, &query_terms, &match_mode)
+                })
+                .collect::<Vec<_>>();
+            let total_matched = matched.len();
+            let page_links = matched
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|entry| {
+                    json!({
+                        "text": entry.text,
+                        "href": entry.href,
+                        "url": entry.url
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let structured = json!({
+                "url": resolved_url.to_string(),
+                "title": title,
+                "query": query,
+                "match_mode": match_mode,
+                "offset": offset,
+                "limit": limit,
+                "max_fetch_bytes": max_fetch_bytes,
+                "html_truncated": truncated,
+                "total_matched": total_matched,
+                "returned": page_links.len(),
+                "links": page_links
+            });
+            Ok(tool_ok_result(
+                &format!(
+                    "web_search_links matched {total_matched} link(s) at {} and returned {} result(s) (offset={}, limit={}).",
+                    resolved_url,
+                    structured["returned"].as_u64().unwrap_or(0),
+                    offset,
+                    limit
+                ),
                 structured,
             ))
         }
@@ -1649,6 +1745,193 @@ impl std::io::Write for SharedWriteBuffer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+struct HtmlLinkEntry {
+    text: String,
+    href: String,
+    url: String,
+}
+
+async fn fetch_web_page_html(
+    url: &str,
+    max_fetch_bytes: usize,
+) -> Result<(reqwest::Url, String, bool)> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("url must use http or https scheme"));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(35))
+        .user_agent("graboid-tools/0.1")
+        .build()
+        .context("failed creating web search client")?;
+    let response = client
+        .get(parsed)
+        .header("accept", "text/html,application/xhtml+xml")
+        .send()
+        .await
+        .context("web_search_links request failed")?;
+    if !response.status().is_success() {
+        return Err(anyhow!("request failed with status {}", response.status()));
+    }
+
+    let resolved_url = response.url().clone();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.contains("text/html") && !content_type.contains("application/xhtml+xml") {
+        return Err(anyhow!(
+            "URL did not return HTML content (content-type={content_type})"
+        ));
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .context("failed reading HTML response body")?;
+    let truncated = body.len() > max_fetch_bytes;
+    let body_bytes = if truncated {
+        &body[..max_fetch_bytes]
+    } else {
+        body.as_ref()
+    };
+    let html = String::from_utf8_lossy(body_bytes).to_string();
+    Ok((resolved_url, html, truncated))
+}
+
+fn extract_html_title(html: &str) -> String {
+    let Ok(title_re) = Regex::new(r#"(?is)<title[^>]*>(.*?)</title>"#) else {
+        return String::new();
+    };
+    let Ok(tag_re) = Regex::new(r"(?is)<[^>]+>") else {
+        return String::new();
+    };
+    let Some(captures) = title_re.captures(html) else {
+        return String::new();
+    };
+    let Some(raw_title) = captures.get(1) else {
+        return String::new();
+    };
+    tag_re
+        .replace_all(raw_title.as_str(), "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_html_links(base_url: &reqwest::Url, html: &str) -> Vec<HtmlLinkEntry> {
+    let Ok(anchor_re) = Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#)
+    else {
+        return Vec::new();
+    };
+    let Ok(tag_re) = Regex::new(r"(?is)<[^>]+>") else {
+        return Vec::new();
+    };
+
+    let mut links = Vec::new();
+    let mut seen = HashSet::new();
+
+    for capture in anchor_re.captures_iter(html) {
+        let Some(href_match) = capture.get(1) else {
+            continue;
+        };
+        let href = href_match.as_str().trim();
+        if href.is_empty()
+            || href.starts_with('#')
+            || href.starts_with("javascript:")
+            || href.starts_with("mailto:")
+        {
+            continue;
+        }
+
+        let resolved = if href.starts_with("magnet:") {
+            href.to_string()
+        } else if href.starts_with("http://") || href.starts_with("https://") {
+            match reqwest::Url::parse(href) {
+                Ok(value) => value.to_string(),
+                Err(_) => continue,
+            }
+        } else {
+            match base_url.join(href) {
+                Ok(value) => value.to_string(),
+                Err(_) => continue,
+            }
+        };
+
+        if !resolved.starts_with("http://")
+            && !resolved.starts_with("https://")
+            && !resolved.starts_with("magnet:")
+        {
+            continue;
+        }
+
+        if !seen.insert(resolved.clone()) {
+            continue;
+        }
+
+        let text = capture
+            .get(2)
+            .map(|group| group.as_str())
+            .unwrap_or_default();
+        let text = tag_re
+            .replace_all(text, "")
+            .replace('\n', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        links.push(HtmlLinkEntry {
+            text,
+            href: href.to_string(),
+            url: resolved,
+        });
+    }
+
+    links
+}
+
+fn tokenize_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for term in query
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        if seen.insert(term.to_string()) {
+            terms.push(term.to_string());
+        }
+    }
+    if terms.is_empty() {
+        let fallback = query.trim().to_ascii_lowercase();
+        if !fallback.is_empty() {
+            return vec![fallback];
+        }
+    }
+    terms
+}
+
+fn link_matches_query(entry: &HtmlLinkEntry, query_terms: &[String], match_mode: &str) -> bool {
+    if query_terms.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {} {}",
+        entry.text.to_ascii_lowercase(),
+        entry.href.to_ascii_lowercase(),
+        entry.url.to_ascii_lowercase()
+    );
+    if match_mode == "any" {
+        query_terms.iter().any(|term| haystack.contains(term))
+    } else {
+        query_terms.iter().all(|term| haystack.contains(term))
     }
 }
 
