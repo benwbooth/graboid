@@ -30,6 +30,16 @@ struct FileConfig {
     browser_mode: Option<String>,
     browser_use_mcp_command: Option<String>,
     browser_use_mcp_args: Option<String>,
+    navigation_runtime_mode: Option<String>,
+    navigation_fast_model: Option<String>,
+    navigation_accuracy_model: Option<String>,
+    navigation_startup_silence_seconds: Option<u64>,
+    navigation_idle_silence_seconds: Option<u64>,
+    navigation_post_discovery_idle_finish_seconds: Option<u64>,
+    navigation_waiting_log_interval_seconds: Option<u64>,
+    navigation_idle_log_interval_seconds: Option<u64>,
+    navigation_session_reuse: Option<bool>,
+    navigation_session_max_attempts: Option<usize>,
     claude_timeout_seconds: Option<u64>,
     download_timeout_seconds: Option<u64>,
     ollama_host: Option<String>,
@@ -204,6 +214,56 @@ const CONFIG_FIELD_SPECS: &[ConfigFieldSpec] = &[
     ConfigFieldSpec {
         key: "browser_use_mcp_args",
         value: ConfigFieldValue::String("browser-use[mcp]"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_runtime_mode",
+        value: ConfigFieldValue::String("claude_adaptive"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_fast_model",
+        value: ConfigFieldValue::String("haiku"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_accuracy_model",
+        value: ConfigFieldValue::String("sonnet"),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_startup_silence_seconds",
+        value: ConfigFieldValue::Integer(35),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_idle_silence_seconds",
+        value: ConfigFieldValue::Integer(20),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_post_discovery_idle_finish_seconds",
+        value: ConfigFieldValue::Integer(8),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_waiting_log_interval_seconds",
+        value: ConfigFieldValue::Integer(5),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_idle_log_interval_seconds",
+        value: ConfigFieldValue::Integer(10),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_session_reuse",
+        value: ConfigFieldValue::Bool(false),
+        form_mode: FormFieldMode::Skip,
+    },
+    ConfigFieldSpec {
+        key: "navigation_session_max_attempts",
+        value: ConfigFieldValue::Integer(12),
         form_mode: FormFieldMode::Skip,
     },
     ConfigFieldSpec {
@@ -453,6 +513,16 @@ pub struct AppConfig {
     pub browser_mode: String,
     pub browser_use_mcp_command: String,
     pub browser_use_mcp_args: String,
+    pub navigation_runtime_mode: String,
+    pub navigation_fast_model: String,
+    pub navigation_accuracy_model: String,
+    pub navigation_startup_silence_seconds: u64,
+    pub navigation_idle_silence_seconds: u64,
+    pub navigation_post_discovery_idle_finish_seconds: u64,
+    pub navigation_waiting_log_interval_seconds: u64,
+    pub navigation_idle_log_interval_seconds: u64,
+    pub navigation_session_reuse: bool,
+    pub navigation_session_max_attempts: usize,
     pub claude_timeout_seconds: u64,
     pub download_timeout_seconds: u64,
     pub username: String,
@@ -525,6 +595,16 @@ impl Default for AppConfig {
             browser_mode: "chrome".to_string(),
             browser_use_mcp_command: "uvx".to_string(),
             browser_use_mcp_args: "browser-use[mcp]".to_string(),
+            navigation_runtime_mode: "claude_adaptive".to_string(),
+            navigation_fast_model: "haiku".to_string(),
+            navigation_accuracy_model: "sonnet".to_string(),
+            navigation_startup_silence_seconds: 35,
+            navigation_idle_silence_seconds: 20,
+            navigation_post_discovery_idle_finish_seconds: 8,
+            navigation_waiting_log_interval_seconds: 5,
+            navigation_idle_log_interval_seconds: 10,
+            navigation_session_reuse: false,
+            navigation_session_max_attempts: 12,
             claude_timeout_seconds: 900,
             download_timeout_seconds: 180,
             username: username.clone(),
@@ -649,6 +729,36 @@ impl AppConfig {
             30,
         );
         set_opt_u64_min(
+            &mut self.navigation_startup_silence_seconds,
+            file_cfg.navigation_startup_silence_seconds,
+            3,
+        );
+        set_opt_u64_min(
+            &mut self.navigation_idle_silence_seconds,
+            file_cfg.navigation_idle_silence_seconds,
+            3,
+        );
+        set_opt_u64_min(
+            &mut self.navigation_post_discovery_idle_finish_seconds,
+            file_cfg.navigation_post_discovery_idle_finish_seconds,
+            2,
+        );
+        set_opt_u64_min(
+            &mut self.navigation_waiting_log_interval_seconds,
+            file_cfg.navigation_waiting_log_interval_seconds,
+            1,
+        );
+        set_opt_u64_min(
+            &mut self.navigation_idle_log_interval_seconds,
+            file_cfg.navigation_idle_log_interval_seconds,
+            1,
+        );
+        set_opt_usize_min(
+            &mut self.navigation_session_max_attempts,
+            file_cfg.navigation_session_max_attempts,
+            1,
+        );
+        set_opt_u64_min(
             &mut self.download_timeout_seconds,
             file_cfg.download_timeout_seconds,
             10,
@@ -676,6 +786,10 @@ impl AppConfig {
                 browser_mode,
                 browser_use_mcp_command,
                 browser_use_mcp_args,
+                navigation_runtime_mode,
+                navigation_fast_model,
+                navigation_accuracy_model,
+                navigation_session_reuse,
                 ollama_host,
                 torrent_client,
                 qbittorrent_host,
@@ -719,6 +833,12 @@ impl AppConfig {
 
         if self.llm_model.trim().is_empty() {
             self.llm_model = self.claude_model.clone();
+        }
+        if self.navigation_accuracy_model.trim().is_empty() {
+            self.navigation_accuracy_model = self.llm_model.clone();
+        }
+        if self.navigation_fast_model.trim().is_empty() {
+            self.navigation_fast_model = self.navigation_accuracy_model.clone();
         }
     }
 

@@ -73,6 +73,15 @@
 
           RUST_LOG = "info";
           GRABOID_RS_BIND_ADDR = "127.0.0.1:8000";
+
+          shellHook = ''
+            export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+            export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+            if ! command -v chrome-devtools-mcp &>/dev/null; then
+              echo "Installing chrome-devtools-mcp globally..."
+              npm install -g chrome-devtools-mcp 2>/dev/null
+            fi
+          '';
         };
 
         formatter = pkgs.nixfmt-rfc-style;

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(any(
     feature = "remote-ftp",
@@ -9,7 +9,8 @@ use std::io::Read;
 #[cfg(feature = "remote-sftp")]
 use std::net::TcpStream;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
@@ -31,6 +32,8 @@ use crate::torrent;
 
 const JSONRPC_VERSION: &str = "2.0";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const WEB_PAGE_CACHE_TTL: Duration = Duration::from_secs(45);
+const WEB_PAGE_CACHE_MAX_ENTRIES: usize = 24;
 
 pub async fn run_stdio_server_from_cli() -> Result<()> {
     let mut config_path: Option<PathBuf> = None;
@@ -53,11 +56,15 @@ pub async fn run_stdio_server_from_cli() -> Result<()> {
 async fn run_stdio_server(config_path: Option<&Path>) -> Result<()> {
     let mut reader = BufReader::new(io::stdin());
     let mut writer = BufWriter::new(io::stdout());
+    let mut wire_format: Option<JsonRpcWireFormat> = None;
 
     loop {
-        let Some(payload) = read_jsonrpc_message(&mut reader).await? else {
+        let Some((payload, detected_wire_format)) =
+            read_jsonrpc_message(&mut reader, wire_format).await?
+        else {
             break;
         };
+        wire_format = Some(detected_wire_format);
 
         let request = match parse_jsonrpc_request(payload) {
             Ok(request) => request,
@@ -68,7 +75,12 @@ async fn run_stdio_server(config_path: Option<&Path>) -> Result<()> {
                     "Invalid JSON-RPC request",
                     err.to_string(),
                 );
-                write_jsonrpc_message(&mut writer, &response).await?;
+                write_jsonrpc_message(
+                    &mut writer,
+                    &response,
+                    wire_format.unwrap_or(JsonRpcWireFormat::ContentLength),
+                )
+                .await?;
                 continue;
             }
         };
@@ -79,7 +91,12 @@ async fn run_stdio_server(config_path: Option<&Path>) -> Result<()> {
         };
 
         let response = handle_request(id, &request.method, &request.params, config_path).await;
-        write_jsonrpc_message(&mut writer, &response).await?;
+        write_jsonrpc_message(
+            &mut writer,
+            &response,
+            wire_format.unwrap_or(JsonRpcWireFormat::ContentLength),
+        )
+        .await?;
     }
 
     Ok(())
@@ -150,6 +167,15 @@ async fn handle_request(
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum JsonRpcWireFormat {
+    ContentLength,
+    Ndjson,
+}
+
+static WEB_SEARCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static WEB_PAGE_CACHE: OnceLock<Mutex<HashMap<String, CachedWebPage>>> = OnceLock::new();
+
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -176,11 +202,33 @@ fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "description": "Optional search text; links are filtered by these terms." },
                     "match_mode": {
                         "type": "string",
-                        "enum": ["all", "any"],
-                        "description": "When query has multiple terms, require all or any term match. Default: all."
+                        "enum": ["all", "any", "fuzzy"],
+                        "description": "When query has multiple terms, require all or any term match. `fuzzy` is accepted as an alias for `any`. Default: all."
                     },
                     "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matched links before returning results." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum links to return. Default: 200." },
+                    "max_fetch_bytes": { "type": "integer", "minimum": 4096, "maximum": 4000000, "description": "Maximum HTML bytes to fetch/parse. Default: 2000000." }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "web_read_page",
+            "description": "Fetch an HTML page and return a simplified text view plus links. Useful when raw browser snapshots are too noisy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "HTTP/HTTPS page URL to fetch." },
+                    "query": { "type": "string", "description": "Optional search text for filtering the returned links." },
+                    "match_mode": {
+                        "type": "string",
+                        "enum": ["all", "any", "fuzzy"],
+                        "description": "When query has multiple terms, require all or any term match. `fuzzy` is accepted as an alias for `any`. Default: all."
+                    },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matched links before returning results." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum links to return. Default: 120." },
+                    "text_chars": { "type": "integer", "minimum": 500, "maximum": 40000, "description": "Maximum simplified text characters to return. Default: 8000." },
                     "max_fetch_bytes": { "type": "integer", "minimum": 4096, "maximum": 4000000, "description": "Maximum HTML bytes to fetch/parse. Default: 2000000." }
                 },
                 "required": ["url"],
@@ -336,14 +384,13 @@ async fn handle_tool_call(params: &Value, config_path: Option<&Path>) -> Result<
                 .unwrap_or("")
                 .trim()
                 .to_string();
-            let match_mode = optional_string(&args, "match_mode")
+            let requested_match_mode = optional_string(&args, "match_mode")
                 .unwrap_or("all")
                 .to_ascii_lowercase();
-            if match_mode != "all" && match_mode != "any" {
-                return Ok(tool_error_result(
-                    "match_mode must be either `all` or `any`",
-                ));
-            }
+            let match_mode = match requested_match_mode.as_str() {
+                "any" | "fuzzy" => "any".to_string(),
+                _ => "all".to_string(),
+            };
             let offset = optional_u64(&args, "offset").unwrap_or(0) as usize;
             let limit = optional_u64(&args, "limit")
                 .map(|value| value.clamp(1, 500) as usize)
@@ -351,11 +398,12 @@ async fn handle_tool_call(params: &Value, config_path: Option<&Path>) -> Result<
             let max_fetch_bytes = optional_u64(&args, "max_fetch_bytes")
                 .map(|value| value.clamp(4096, 4_000_000) as usize)
                 .unwrap_or(2_000_000);
-
-            let (resolved_url, html, truncated) =
-                fetch_web_page_html(page_url, max_fetch_bytes).await?;
-            let title = extract_html_title(&html);
-            let links = extract_html_links(&resolved_url, &html);
+            let (snapshot, cache_hit) = fetch_web_page_snapshot(page_url, max_fetch_bytes).await?;
+            let resolved_url = snapshot.resolved_url;
+            let title = snapshot.title;
+            let links = snapshot.links;
+            let truncated = snapshot.truncated;
+            let total_links = links.len();
             let query_terms = tokenize_query_terms(&query);
             let matched = links
                 .into_iter()
@@ -367,15 +415,14 @@ async fn handle_tool_call(params: &Value, config_path: Option<&Path>) -> Result<
                 })
                 .collect::<Vec<_>>();
             let total_matched = matched.len();
-            let page_links = matched
-                .into_iter()
-                .skip(offset)
-                .take(limit)
+            let returned_entries = matched.iter().skip(offset).take(limit).collect::<Vec<_>>();
+            let page_links = returned_entries
+                .iter()
                 .map(|entry| {
                     json!({
-                        "text": entry.text,
-                        "href": entry.href,
-                        "url": entry.url
+                        "text": entry.text.as_str(),
+                        "href": entry.href.as_str(),
+                        "url": entry.url.as_str()
                     })
                 })
                 .collect::<Vec<_>>();
@@ -384,25 +431,117 @@ async fn handle_tool_call(params: &Value, config_path: Option<&Path>) -> Result<
                 "url": resolved_url.to_string(),
                 "title": title,
                 "query": query,
+                "requested_match_mode": requested_match_mode,
                 "match_mode": match_mode,
                 "offset": offset,
                 "limit": limit,
                 "max_fetch_bytes": max_fetch_bytes,
+                "cache_hit": cache_hit,
                 "html_truncated": truncated,
+                "total_links": total_links,
                 "total_matched": total_matched,
                 "returned": page_links.len(),
                 "links": page_links
             });
-            Ok(tool_ok_result(
-                &format!(
-                    "web_search_links matched {total_matched} link(s) at {} and returned {} result(s) (offset={}, limit={}).",
-                    resolved_url,
-                    structured["returned"].as_u64().unwrap_or(0),
-                    offset,
-                    limit
-                ),
-                structured,
-            ))
+            let text = format_web_search_links_text(
+                &resolved_url,
+                &title,
+                &query,
+                &requested_match_mode,
+                &match_mode,
+                offset,
+                limit,
+                total_matched,
+                truncated,
+                &returned_entries,
+            );
+            Ok(tool_ok_result(&text, structured))
+        }
+        "web_read_page" => {
+            let page_url = required_string(&args, "url")?;
+            let query = optional_string(&args, "query")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let requested_match_mode = optional_string(&args, "match_mode")
+                .unwrap_or("all")
+                .to_ascii_lowercase();
+            let match_mode = match requested_match_mode.as_str() {
+                "any" | "fuzzy" => "any".to_string(),
+                _ => "all".to_string(),
+            };
+            let offset = optional_u64(&args, "offset").unwrap_or(0) as usize;
+            let limit = optional_u64(&args, "limit")
+                .map(|value| value.clamp(1, 500) as usize)
+                .unwrap_or(120);
+            let text_chars = optional_u64(&args, "text_chars")
+                .map(|value| value.clamp(500, 40_000) as usize)
+                .unwrap_or(8_000);
+            let max_fetch_bytes = optional_u64(&args, "max_fetch_bytes")
+                .map(|value| value.clamp(4096, 4_000_000) as usize)
+                .unwrap_or(2_000_000);
+
+            let (snapshot, cache_hit) = fetch_web_page_snapshot(page_url, max_fetch_bytes).await?;
+            let resolved_url = snapshot.resolved_url;
+            let title = snapshot.title;
+            let links = snapshot.links;
+            let simplified_text = truncate_display(snapshot.simplified_text.trim(), text_chars);
+            let total_links = links.len();
+            let query_terms = tokenize_query_terms(&query);
+            let matched = links
+                .into_iter()
+                .filter(|entry| {
+                    if query_terms.is_empty() {
+                        return true;
+                    }
+                    link_matches_query(entry, &query_terms, &match_mode)
+                })
+                .collect::<Vec<_>>();
+            let total_matched = matched.len();
+            let returned_entries = matched.iter().skip(offset).take(limit).collect::<Vec<_>>();
+            let page_links = returned_entries
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "text": entry.text.as_str(),
+                        "href": entry.href.as_str(),
+                        "url": entry.url.as_str()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let structured = json!({
+                "url": resolved_url.to_string(),
+                "title": title,
+                "query": query,
+                "requested_match_mode": requested_match_mode,
+                "match_mode": match_mode,
+                "offset": offset,
+                "limit": limit,
+                "text_chars": text_chars,
+                "max_fetch_bytes": max_fetch_bytes,
+                "cache_hit": cache_hit,
+                "html_truncated": snapshot.truncated,
+                "total_links": total_links,
+                "total_matched": total_matched,
+                "returned": page_links.len(),
+                "text": simplified_text,
+                "links": page_links
+            });
+            let text = format_web_read_page_text(
+                &resolved_url,
+                &title,
+                &query,
+                &requested_match_mode,
+                &match_mode,
+                offset,
+                limit,
+                total_matched,
+                snapshot.truncated,
+                &simplified_text,
+                &returned_entries,
+            );
+            Ok(tool_ok_result(&text, structured))
         }
         "torrent_add" => {
             let source = required_string(&args, "source")?;
@@ -1748,19 +1887,31 @@ impl std::io::Write for SharedWriteBuffer {
     }
 }
 
+#[derive(Clone)]
 struct HtmlLinkEntry {
     text: String,
     href: String,
     url: String,
 }
 
-async fn fetch_web_page_html(
-    url: &str,
-    max_fetch_bytes: usize,
-) -> Result<(reqwest::Url, String, bool)> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(anyhow!("url must use http or https scheme"));
+#[derive(Clone)]
+struct HtmlPageSnapshot {
+    resolved_url: reqwest::Url,
+    title: String,
+    links: Vec<HtmlLinkEntry>,
+    simplified_text: String,
+    truncated: bool,
+}
+
+#[derive(Clone)]
+struct CachedWebPage {
+    fetched_at: Instant,
+    snapshot: HtmlPageSnapshot,
+}
+
+fn web_search_client() -> Result<&'static reqwest::Client> {
+    if let Some(client) = WEB_SEARCH_CLIENT.get() {
+        return Ok(client);
     }
 
     let client = reqwest::Client::builder()
@@ -1768,6 +1919,83 @@ async fn fetch_web_page_html(
         .user_agent("graboid-tools/0.1")
         .build()
         .context("failed creating web search client")?;
+    let _ = WEB_SEARCH_CLIENT.set(client);
+    WEB_SEARCH_CLIENT
+        .get()
+        .ok_or_else(|| anyhow!("failed to initialize web search client"))
+}
+
+fn web_page_cache() -> &'static Mutex<HashMap<String, CachedWebPage>> {
+    WEB_PAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn web_page_cache_key(url: &str, max_fetch_bytes: usize) -> String {
+    format!("{}|{}", max_fetch_bytes, url.trim())
+}
+
+fn fetch_cached_web_page_snapshot(url: &str, max_fetch_bytes: usize) -> Option<HtmlPageSnapshot> {
+    let key = web_page_cache_key(url, max_fetch_bytes);
+    let now = Instant::now();
+    let cache = web_page_cache();
+    let mut guard = cache.lock().ok()?;
+    guard
+        .retain(|_, cached| now.saturating_duration_since(cached.fetched_at) <= WEB_PAGE_CACHE_TTL);
+    guard.get(&key).map(|cached| cached.snapshot.clone())
+}
+
+fn store_cached_web_page_snapshot(
+    request_url: &str,
+    max_fetch_bytes: usize,
+    snapshot: &HtmlPageSnapshot,
+) {
+    let cache = web_page_cache();
+    let Ok(mut guard) = cache.lock() else {
+        return;
+    };
+
+    let now = Instant::now();
+    let record = CachedWebPage {
+        fetched_at: now,
+        snapshot: snapshot.clone(),
+    };
+    guard.insert(
+        web_page_cache_key(request_url, max_fetch_bytes),
+        record.clone(),
+    );
+    guard.insert(
+        web_page_cache_key(snapshot.resolved_url.as_str(), max_fetch_bytes),
+        record,
+    );
+
+    if guard.len() <= WEB_PAGE_CACHE_MAX_ENTRIES {
+        return;
+    }
+
+    let mut entries = guard
+        .iter()
+        .map(|(key, value)| (key.clone(), value.fetched_at))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, fetched_at)| *fetched_at);
+    let remove_count = guard.len().saturating_sub(WEB_PAGE_CACHE_MAX_ENTRIES);
+    for (key, _) in entries.into_iter().take(remove_count) {
+        guard.remove(&key);
+    }
+}
+
+async fn fetch_web_page_snapshot(
+    url: &str,
+    max_fetch_bytes: usize,
+) -> Result<(HtmlPageSnapshot, bool)> {
+    if let Some(snapshot) = fetch_cached_web_page_snapshot(url, max_fetch_bytes) {
+        return Ok((snapshot, true));
+    }
+
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("url must use http or https scheme"));
+    }
+
+    let client = web_search_client()?;
     let response = client
         .get(parsed)
         .header("accept", "text/html,application/xhtml+xml")
@@ -1802,7 +2030,66 @@ async fn fetch_web_page_html(
         body.as_ref()
     };
     let html = String::from_utf8_lossy(body_bytes).to_string();
-    Ok((resolved_url, html, truncated))
+    let title = extract_html_title(&html);
+    let links = extract_html_links(&resolved_url, &html);
+    let simplified_text = simplify_html_for_reading(&html);
+    let snapshot = HtmlPageSnapshot {
+        resolved_url,
+        title,
+        links,
+        simplified_text,
+        truncated,
+    };
+    store_cached_web_page_snapshot(url, max_fetch_bytes, &snapshot);
+    Ok((snapshot, false))
+}
+
+fn simplify_html_for_reading(html: &str) -> String {
+    static SCRIPT_RE: OnceLock<Regex> = OnceLock::new();
+    static STYLE_RE: OnceLock<Regex> = OnceLock::new();
+    static COMMENT_RE: OnceLock<Regex> = OnceLock::new();
+    static BLOCK_RE: OnceLock<Regex> = OnceLock::new();
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+
+    let script_re = SCRIPT_RE.get_or_init(|| {
+        Regex::new(r"(?is)<script\b[^>]*>.*?</script>").expect("valid script regex")
+    });
+    let style_re = STYLE_RE
+        .get_or_init(|| Regex::new(r"(?is)<style\b[^>]*>.*?</style>").expect("valid style regex"));
+    let comment_re =
+        COMMENT_RE.get_or_init(|| Regex::new(r"(?is)<!--.*?-->").expect("valid comment regex"));
+    let block_re = BLOCK_RE.get_or_init(|| {
+        Regex::new(
+            r"(?is)</?(br|p|div|li|tr|h1|h2|h3|h4|h5|h6|section|article|main|table|ul|ol)[^>]*>",
+        )
+        .expect("valid block regex")
+    });
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"(?is)<[^>]+>").expect("valid tag regex"));
+
+    let text = comment_re.replace_all(html, " ");
+    let text = script_re.replace_all(&text, " ");
+    let text = style_re.replace_all(&text, " ");
+    let text = block_re.replace_all(&text, "\n");
+    let text = tag_re.replace_all(&text, " ");
+    let text = decode_basic_html_entities(&text);
+
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_basic_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
 }
 
 fn extract_html_title(html: &str) -> String {
@@ -1935,6 +2222,153 @@ fn link_matches_query(entry: &HtmlLinkEntry, query_terms: &[String], match_mode:
     }
 }
 
+fn format_web_search_links_text(
+    resolved_url: &reqwest::Url,
+    title: &str,
+    query: &str,
+    requested_match_mode: &str,
+    match_mode: &str,
+    offset: usize,
+    limit: usize,
+    total_matched: usize,
+    truncated: bool,
+    returned_entries: &[&HtmlLinkEntry],
+) -> String {
+    let mut lines = Vec::new();
+    let query_text = if query.trim().is_empty() {
+        "<none>".to_string()
+    } else {
+        query.trim().to_string()
+    };
+
+    lines.push(format!(
+        "web_search_links matched {total_matched} link(s) at {resolved_url} and returned {} result(s) (offset={offset}, limit={limit}, query={query_text}, match_mode={requested_match_mode}->{match_mode}).",
+        returned_entries.len()
+    ));
+
+    if !title.trim().is_empty() {
+        lines.push(format!("Page title: {}", title.trim()));
+    }
+    if truncated {
+        lines.push(
+            "Note: HTML content exceeded max_fetch_bytes and was truncated before parsing."
+                .to_string(),
+        );
+    }
+
+    if returned_entries.is_empty() {
+        lines.push(
+            "No links in this window. Try changing query, match_mode, offset, or limit."
+                .to_string(),
+        );
+        return lines.join("\n");
+    }
+
+    lines.push("Returned links:".to_string());
+    for (idx, entry) in returned_entries.iter().take(25).enumerate() {
+        let label = entry.text.trim();
+        let label = if label.is_empty() {
+            "(no anchor text)".to_string()
+        } else {
+            truncate_display(label, 140)
+        };
+        lines.push(format!("{}. {} -> {}", offset + idx + 1, label, entry.url));
+    }
+
+    if returned_entries.len() > 25 {
+        lines.push(format!(
+            "... {} more returned link(s) omitted from text output.",
+            returned_entries.len() - 25
+        ));
+    }
+
+    let hidden = total_matched.saturating_sub(offset + returned_entries.len());
+    if hidden > 0 {
+        lines.push(format!(
+            "{hidden} additional matched link(s) are outside the current offset/limit window."
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_web_read_page_text(
+    resolved_url: &reqwest::Url,
+    title: &str,
+    query: &str,
+    requested_match_mode: &str,
+    match_mode: &str,
+    offset: usize,
+    limit: usize,
+    total_matched: usize,
+    truncated: bool,
+    simplified_text: &str,
+    returned_entries: &[&HtmlLinkEntry],
+) -> String {
+    let mut lines = Vec::new();
+    let query_text = if query.trim().is_empty() {
+        "<none>".to_string()
+    } else {
+        query.trim().to_string()
+    };
+    lines.push(format!(
+        "web_read_page fetched {resolved_url} and returned {} link result(s) (matched={total_matched}, offset={offset}, limit={limit}, query={query_text}, match_mode={requested_match_mode}->{match_mode}).",
+        returned_entries.len()
+    ));
+    if !title.trim().is_empty() {
+        lines.push(format!("Page title: {}", title.trim()));
+    }
+    if truncated {
+        lines.push(
+            "Note: HTML content exceeded max_fetch_bytes and was truncated before parsing."
+                .to_string(),
+        );
+    }
+    if !simplified_text.trim().is_empty() {
+        lines.push("Simplified page text:".to_string());
+        lines.push(simplified_text.trim().to_string());
+    } else {
+        lines.push("Simplified page text is empty.".to_string());
+    }
+
+    if returned_entries.is_empty() {
+        lines.push("No links in this window.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Returned links:".to_string());
+    for (idx, entry) in returned_entries.iter().take(40).enumerate() {
+        let label = entry.text.trim();
+        let label = if label.is_empty() {
+            "(no anchor text)".to_string()
+        } else {
+            truncate_display(label, 140)
+        };
+        lines.push(format!("{}. {} -> {}", offset + idx + 1, label, entry.url));
+    }
+    if returned_entries.len() > 40 {
+        lines.push(format!(
+            "... {} more returned link(s) omitted from text output.",
+            returned_entries.len() - 40
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 fn format_torznab_text(
     query: &str,
     fresh: bool,
@@ -2015,8 +2449,83 @@ fn tool_error_result(message: &str) -> Value {
     })
 }
 
-async fn read_jsonrpc_message(reader: &mut BufReader<io::Stdin>) -> Result<Option<Value>> {
+async fn read_jsonrpc_message(
+    reader: &mut BufReader<io::Stdin>,
+    preferred_wire_format: Option<JsonRpcWireFormat>,
+) -> Result<Option<(Value, JsonRpcWireFormat)>> {
+    match preferred_wire_format {
+        Some(JsonRpcWireFormat::Ndjson) => read_ndjson_message(reader).await,
+        Some(JsonRpcWireFormat::ContentLength) => read_content_length_message(reader, None).await,
+        None => read_autodetected_message(reader).await,
+    }
+}
+
+async fn read_autodetected_message(
+    reader: &mut BufReader<io::Stdin>,
+) -> Result<Option<(Value, JsonRpcWireFormat)>> {
+    let mut first_line = String::new();
+    loop {
+        first_line.clear();
+        let read = reader
+            .read_line(&mut first_line)
+            .await
+            .context("failed reading MCP message")?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if first_line.trim().is_empty() {
+            continue;
+        }
+        break;
+    }
+
+    let trimmed = first_line.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let payload =
+            serde_json::from_str::<Value>(trimmed).context("failed decoding NDJSON-RPC payload")?;
+        return Ok(Some((payload, JsonRpcWireFormat::Ndjson)));
+    }
+
+    read_content_length_message(reader, Some(first_line)).await
+}
+
+async fn read_ndjson_message(
+    reader: &mut BufReader<io::Stdin>,
+) -> Result<Option<(Value, JsonRpcWireFormat)>> {
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("failed reading NDJSON-RPC line")?;
+        if read == 0 {
+            return Ok(None);
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let payload =
+            serde_json::from_str::<Value>(trimmed).context("failed decoding NDJSON-RPC payload")?;
+        return Ok(Some((payload, JsonRpcWireFormat::Ndjson)));
+    }
+}
+
+async fn read_content_length_message(
+    reader: &mut BufReader<io::Stdin>,
+    first_header_line: Option<String>,
+) -> Result<Option<(Value, JsonRpcWireFormat)>> {
     let mut content_length: Option<usize> = None;
+
+    if let Some(line) = first_header_line {
+        if let Some((name, value)) = line.trim().split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
 
     loop {
         let mut line = String::new();
@@ -2052,19 +2561,76 @@ async fn read_jsonrpc_message(reader: &mut BufReader<io::Stdin>) -> Result<Optio
 
     let payload =
         serde_json::from_slice::<Value>(&body).context("failed decoding MCP JSON-RPC body")?;
-    Ok(Some(payload))
+    Ok(Some((payload, JsonRpcWireFormat::ContentLength)))
 }
 
-async fn write_jsonrpc_message(writer: &mut BufWriter<io::Stdout>, payload: &Value) -> Result<()> {
-    let body = serde_json::to_vec(payload).context("failed encoding MCP JSON-RPC payload")?;
-    writer
-        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-        .await
-        .context("failed writing MCP message header")?;
-    writer
-        .write_all(&body)
-        .await
-        .context("failed writing MCP message body")?;
-    writer.flush().await.context("failed flushing MCP output")?;
+async fn write_jsonrpc_message(
+    writer: &mut BufWriter<io::Stdout>,
+    payload: &Value,
+    wire_format: JsonRpcWireFormat,
+) -> Result<()> {
+    match wire_format {
+        JsonRpcWireFormat::ContentLength => {
+            let body =
+                serde_json::to_vec(payload).context("failed encoding MCP JSON-RPC payload")?;
+            writer
+                .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+                .await
+                .context("failed writing MCP message header")?;
+            writer
+                .write_all(&body)
+                .await
+                .context("failed writing MCP message body")?;
+            writer.flush().await.context("failed flushing MCP output")?;
+        }
+        JsonRpcWireFormat::Ndjson => {
+            let line =
+                serde_json::to_string(payload).context("failed encoding NDJSON-RPC payload")?;
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .context("failed writing NDJSON-RPC payload")?;
+            writer
+                .write_all(b"\n")
+                .await
+                .context("failed writing NDJSON-RPC newline")?;
+            writer
+                .flush()
+                .await
+                .context("failed flushing NDJSON-RPC output")?;
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_basic_html_entities, simplify_html_for_reading};
+
+    #[test]
+    fn decode_entities_handles_common_sequences() {
+        let decoded = decode_basic_html_entities("A&amp;B&nbsp;&lt;tag&gt;&#39;ok&#39;");
+        assert_eq!(decoded, "A&B <tag>'ok'");
+    }
+
+    #[test]
+    fn simplify_html_strips_script_style_and_tags() {
+        let html = r#"
+            <html>
+              <head>
+                <style>.hide { display: none; }</style>
+                <script>console.log("x")</script>
+              </head>
+              <body>
+                <h1>Example</h1>
+                <p>Hello <b>world</b> &amp; friends.</p>
+              </body>
+            </html>
+        "#;
+        let simplified = simplify_html_for_reading(html);
+        assert!(simplified.contains("Example"));
+        assert!(simplified.contains("Hello world & friends."));
+        assert!(!simplified.contains("console.log"));
+        assert!(!simplified.contains("display: none"));
+    }
 }

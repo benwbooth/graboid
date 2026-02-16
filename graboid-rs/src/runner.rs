@@ -19,7 +19,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, warn};
 
 use crate::archives::{default_extract_dir, extract_archive, is_archive};
-use crate::claude::{NavEvent, NavigationOutcome, run_navigation};
+use crate::claude::{NavEvent, NavigationOutcome, run_navigation, warm_navigation_runtime};
 use crate::config::AppConfig;
 use crate::db::JobDb;
 use crate::events::ServerEvent;
@@ -31,8 +31,9 @@ use crate::torrent;
 const MAX_BROWSE_ATTEMPTS: usize = 2;
 const MAX_BROWSE_STEPS_PER_ATTEMPT: usize = 32;
 const MAX_BROWSE_STEPS_PER_JOB: i64 = 72;
-const BROWSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(80);
+const BROWSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(150);
 const BROWSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
+const MAX_FAST_SCAN_CANDIDATES: usize = 80;
 
 #[derive(Clone)]
 pub struct JobRunner {
@@ -76,6 +77,12 @@ impl JobRunner {
         });
 
         runner.clone().spawn_dispatcher(queue_rx);
+        let warm_cfg = runner.config.clone();
+        tokio::spawn(async move {
+            if let Err(err) = warm_navigation_runtime(warm_cfg.as_ref()).await {
+                warn!("navigation runtime warmup skipped: {err:#}");
+            }
+        });
         runner
     }
 
@@ -196,13 +203,14 @@ impl JobRunner {
             None
         };
 
-        let source_preferences = match self.db.preferred_source_domains(12).await {
+        let source_preferences = match self.db.preferred_source_domains(64).await {
             Ok(domains) => domains,
             Err(err) => {
                 warn!(job_id = %job.id, "failed loading source preferences: {err:#}");
                 Vec::new()
             }
         };
+        let source_preferences = normalize_source_preferences(source_preferences);
         let prefer_torrent_sources = prompt_prefers_torrent_sources(&job.prompt, &job.source_url);
         if !source_preferences.is_empty() && !prefer_torrent_sources {
             self.log(
@@ -210,13 +218,8 @@ impl JobRunner {
                 "INFO",
                 "browse",
                 &format!(
-                    "Loaded source memory ranking: {}",
-                    source_preferences
-                        .iter()
-                        .take(6)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "Loaded source memory ranking ({} source domain(s))",
+                    source_preferences.len()
                 ),
             )
             .await?;
@@ -263,22 +266,15 @@ impl JobRunner {
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "-".to_string());
                         let indexer = candidate.indexer.clone().unwrap_or_else(|| "-".to_string());
-                        let details = candidate
-                            .details_url
-                            .clone()
-                            .unwrap_or_else(|| "-".to_string());
                         self.log(
                             &job.id,
                             "INFO",
                             "browse",
                             &format!(
-                                "Torznab candidate {}: {} | seeders={} | indexer={} | url={} | details={}",
+                                "Torznab candidate {}: seeders={} | indexer={}",
                                 idx + 1,
-                                candidate.title,
                                 seeders,
                                 indexer,
-                                candidate.download_url,
-                                details
                             ),
                         )
                         .await?;
@@ -305,6 +301,13 @@ impl JobRunner {
             }
         }
 
+        let initial_file_filter_count = job
+            .file_filter
+            .iter()
+            .map(|pattern| pattern.trim())
+            .filter(|pattern| !pattern.is_empty())
+            .count();
+        let mut agent_filter_hints_added = 0usize;
         let mut failed_urls: Vec<String> = Vec::new();
         for browse_attempt in 1..=MAX_BROWSE_ATTEMPTS {
             let browse_message = if browse_attempt == 1 {
@@ -346,14 +349,29 @@ impl JobRunner {
                 );
                 let prompt =
                     augment_prompt_with_torznab_candidates(&prompt, &torznab_prefetch_candidates);
+                let task_prompt = job.prompt.clone();
                 match self
-                    .run_navigation_attempt(&mut job, &prompt, credential.clone())
+                    .run_navigation_attempt(
+                        &mut job,
+                        &prompt,
+                        &task_prompt,
+                        credential.clone(),
+                        &failed_urls,
+                    )
                     .await
                 {
                     Ok(outcome) => Some(outcome),
                     Err(err) => {
                         let err_text = err.to_string();
+                        let err_text_lower = err_text.to_ascii_lowercase();
                         let fatal_step_budget = err_text.contains("Step budget exceeded");
+                        let fatal_navigation_loop = err_text.contains("Navigation loop detected");
+                        let startup_stall = err_text_lower
+                            .contains("before claude produced first stream output")
+                            || err_text_lower.contains("before codex produced first stream output")
+                            || err_text_lower.contains("while waiting for claude stream startup")
+                            || err_text_lower.contains("while waiting for codex stream startup");
+                        let retryable_agent_stall = err_text.contains("produced no output for");
                         self.log(
                             &job.id,
                             "WARNING",
@@ -376,12 +394,31 @@ impl JobRunner {
                             )
                             .await?;
                             None
-                        } else if browse_attempt < MAX_BROWSE_ATTEMPTS && !fatal_step_budget {
+                        } else if browse_attempt < MAX_BROWSE_ATTEMPTS
+                            && !fatal_step_budget
+                            && !fatal_navigation_loop
+                        {
+                            if retryable_agent_stall {
+                                let stall_context = if startup_stall {
+                                    "startup stall"
+                                } else {
+                                    "runtime stall"
+                                };
+                                self.log(
+                                    &job.id,
+                                    "INFO",
+                                    "browse",
+                                    &format!(
+                                        "Retrying browse attempt after {stall_context}; launching a fresh agent process"
+                                    ),
+                                )
+                                .await?;
+                            }
                             tokio::time::sleep(Duration::from_secs(2)).await;
                             continue;
                         } else {
                             job.fail(format!(
-                                "Browse failed after {MAX_BROWSE_ATTEMPTS} attempts: {err}"
+                                "Browse failed after {browse_attempt} attempt(s): {err}"
                             ));
                             self.persist_job(&job).await?;
                             self.log(&job.id, "ERROR", "browse", &job.error_message)
@@ -393,13 +430,62 @@ impl JobRunner {
                 }
             };
 
+            let agent_reported_success_without_urls = navigation
+                .as_ref()
+                .map(|outcome| {
+                    outcome.found_urls.is_empty()
+                        && outcome.downloaded_files.is_empty()
+                        && outcome
+                            .raw_output
+                            .to_ascii_lowercase()
+                            .contains("[result] success: true")
+                })
+                .unwrap_or(false);
+            let agent_reported_problem = navigation
+                .as_ref()
+                .and_then(|outcome| extract_agent_problem(&outcome.raw_output));
+            let agent_reported_failure_without_urls = navigation
+                .as_ref()
+                .map(|outcome| {
+                    outcome.found_urls.is_empty()
+                        && outcome.downloaded_files.is_empty()
+                        && (outcome
+                            .raw_output
+                            .to_ascii_lowercase()
+                            .contains("[result] success: false")
+                            || extract_agent_problem(&outcome.raw_output).is_some())
+                })
+                .unwrap_or(false);
+
             if let Some(navigation) = navigation {
-                self.apply_navigation_outcome(&mut job, &navigation).await?;
+                let added_hints = self.apply_navigation_outcome(&mut job, &navigation).await?;
+                agent_filter_hints_added += added_hints;
                 self.persist_job(&job).await?;
             }
 
             if job.downloaded_files.is_empty() && job.found_urls.is_empty() {
-                if browse_attempt < MAX_BROWSE_ATTEMPTS {
+                if agent_reported_success_without_urls {
+                    self.log(
+                        &job.id,
+                        "WARNING",
+                        "browse",
+                        "Agent reported success but emitted no URLs/files; skipping redundant retry",
+                    )
+                    .await?;
+                } else if agent_reported_failure_without_urls {
+                    let reason = agent_reported_problem
+                        .as_deref()
+                        .unwrap_or("agent reported no downloadable artifacts");
+                    self.log(
+                        &job.id,
+                        "WARNING",
+                        "browse",
+                        &format!(
+                            "Agent reported terminal browse failure; skipping retry: {reason}"
+                        ),
+                    )
+                    .await?;
+                } else if browse_attempt < MAX_BROWSE_ATTEMPTS {
                     self.log(
                         &job.id,
                         "WARNING",
@@ -410,7 +496,11 @@ impl JobRunner {
                     continue;
                 }
 
-                job.fail("No download links or files were found");
+                if let Some(problem) = agent_reported_problem {
+                    job.fail(format!("No download links or files were found: {problem}"));
+                } else {
+                    job.fail("No download links or files were found");
+                }
                 self.persist_job(&job).await?;
                 self.log(&job.id, "ERROR", "browse", &job.error_message)
                     .await?;
@@ -419,6 +509,54 @@ impl JobRunner {
             }
 
             if job.downloaded_files.is_empty() {
+                if !job.found_urls.is_empty() {
+                    let (validated_urls, rejected_urls) = self
+                        .filter_download_candidates(&job.id, &job.found_urls)
+                        .await?;
+
+                    for (url, reason) in &rejected_urls {
+                        self.log(
+                            &job.id,
+                            "INFO",
+                            "download",
+                            &format!("Skipping candidate URL {url}: {reason}"),
+                        )
+                        .await?;
+                    }
+                    if !rejected_urls.is_empty() {
+                        let rejected_only = rejected_urls
+                            .iter()
+                            .map(|(url, _)| url.clone())
+                            .collect::<Vec<_>>();
+                        merge_unique_strings(&mut failed_urls, &rejected_only);
+                    }
+
+                    if validated_urls.len() != job.found_urls.len() {
+                        job.found_urls = validated_urls;
+                        self.persist_job(&job).await?;
+                    }
+
+                    if job.found_urls.is_empty() {
+                        if browse_attempt < MAX_BROWSE_ATTEMPTS {
+                            self.log(
+                                &job.id,
+                                "WARNING",
+                                "browse",
+                                "All discovered URLs appear to be non-download pages; retrying source discovery",
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        job.fail("No downloadable URLs were found after validating candidates");
+                        self.persist_job(&job).await?;
+                        self.log(&job.id, "ERROR", "download", &job.error_message)
+                            .await?;
+                        self.set_runtime_status(false, String::new()).await;
+                        return Ok(());
+                    }
+                }
+
                 job.set_status(JobStatus::Downloading);
                 job.set_phase(JobPhase::Download);
                 job.set_progress(45.0, "Downloading files");
@@ -663,7 +801,9 @@ impl JobRunner {
                 )
                 .await?;
 
-                match extract_archive(path.clone(), extract_dir.clone(), job.file_filter.clone())
+                // Always extract archive contents first, then apply filtering once afterward.
+                // This avoids hard failures when a hint filter is too narrow for archive internals.
+                match extract_archive(path.clone(), extract_dir.clone(), Vec::new())
                     .await
                 {
                     Ok(paths) if !paths.is_empty() => {
@@ -701,7 +841,8 @@ impl JobRunner {
 
         if !job.file_filter.is_empty() {
             let matcher = build_file_filter_matcher(&job.file_filter);
-            let before = job.downloaded_files.len();
+            let before_paths = job.downloaded_files.clone();
+            let before = before_paths.len();
             job.downloaded_files
                 .retain(|path| filter_matches(&matcher, path));
             let kept = job.downloaded_files.len();
@@ -716,6 +857,24 @@ impl JobRunner {
                 ),
             )
             .await?;
+
+            if kept == 0
+                && before > 0
+                && initial_file_filter_count == 0
+                && agent_filter_hints_added > 0
+            {
+                self.log(
+                    &job.id,
+                    "WARNING",
+                    "extract",
+                    &format!(
+                        "Agent-provided file filter hints matched no extracted files; falling back to unfiltered extracted outputs ({before} file(s))"
+                    ),
+                )
+                .await?;
+                job.downloaded_files = before_paths;
+            }
+
             self.persist_job(&job).await?;
         }
 
@@ -773,8 +932,17 @@ impl JobRunner {
         &self,
         job: &mut Job,
         prompt: &str,
+        task_prompt: &str,
         credential: Option<(String, String)>,
+        failed_urls: &[String],
     ) -> Result<NavigationOutcome> {
+        let failed_url_set = failed_urls
+            .iter()
+            .map(|url| url.trim())
+            .filter(|url| !url.is_empty())
+            .map(|url| url.to_string())
+            .collect::<HashSet<_>>();
+
         let step_offset = self
             .db
             .list_steps(&job.id)
@@ -787,6 +955,67 @@ impl JobRunner {
             return Err(anyhow::anyhow!(
                 "Step budget exceeded: job already has {step_offset} steps (limit {MAX_BROWSE_STEPS_PER_JOB})"
             ));
+        }
+
+        let fallback_outcome = |urls: &[String]| NavigationOutcome {
+            found_urls: urls.to_vec(),
+            downloaded_files: Vec::new(),
+            raw_output: String::new(),
+        };
+
+        match self
+            .scan_page_for_download_candidates(
+                &job.id,
+                &job.source_url,
+                task_prompt,
+                &job.file_filter,
+            )
+            .await
+        {
+            Ok(scan) => {
+                if scan.total_links >= 250 {
+                    self.log(
+                        &job.id,
+                        "INFO",
+                        "browse",
+                        &format!(
+                            "Fast pre-scan detected {} links on source page {}",
+                            scan.total_links, job.source_url
+                        ),
+                    )
+                    .await?;
+                }
+                let scan_urls = scan
+                    .download_urls
+                    .into_iter()
+                    .filter(|url| !failed_url_set.contains(url))
+                    .collect::<Vec<_>>();
+                if !scan_urls.is_empty() {
+                    self.log(
+                        &job.id,
+                        "INFO",
+                        "browse",
+                        &format!(
+                            "Fast pre-scan found {} download candidate URL(s) on source page; skipping agent navigation startup",
+                            scan_urls.len()
+                        ),
+                    )
+                    .await?;
+                    return Ok(fallback_outcome(&scan_urls));
+                }
+            }
+            Err(err) => {
+                self.log(
+                    &job.id,
+                    "WARNING",
+                    "browse",
+                    &format!(
+                        "Fast pre-scan skipped for source page {}: {err}",
+                        job.source_url
+                    ),
+                )
+                .await?;
+            }
         }
 
         let (nav_tx, mut nav_rx) = mpsc::unbounded_channel::<NavEvent>();
@@ -817,6 +1046,9 @@ impl JobRunner {
         let mut emitted_steps = 0usize;
         let mut screenshot_capture_enabled = true;
         let mut recent_navigate_urls = Vec::new();
+        let mut scanned_page_urls = HashSet::new();
+        let mut fast_scan_candidate_urls = Vec::new();
+        let mut consecutive_unreachable_navigations = 0usize;
         let heartbeat = tokio::time::sleep(BROWSE_HEARTBEAT_INTERVAL);
         tokio::pin!(heartbeat);
         let attempt_timeout = tokio::time::sleep(BROWSE_ATTEMPT_TIMEOUT);
@@ -853,6 +1085,20 @@ impl JobRunner {
                             }
                         }
                         NavEvent::FoundUrl { url } => {
+                            // Reset timeout on activity
+                            attempt_timeout.as_mut().reset(tokio::time::Instant::now() + BROWSE_ATTEMPT_TIMEOUT);
+
+                            if failed_url_set.contains(&url) {
+                                self.log(
+                                    &job.id,
+                                    "DEBUG",
+                                    "browse",
+                                    &format!("Ignoring previously failed URL candidate: {url}"),
+                                )
+                                .await?;
+                                continue;
+                            }
+
                             if job.found_urls.iter().any(|existing| existing == &url) {
                                 continue;
                             }
@@ -875,17 +1121,46 @@ impl JobRunner {
                             is_error,
                             notes,
                         } => {
+                            // Reset timeout on activity
+                            attempt_timeout.as_mut().reset(tokio::time::Instant::now() + BROWSE_ATTEMPT_TIMEOUT);
+
                             emitted_steps += 1;
                             let adjusted_step = step_number + step_offset;
 
                             if emitted_steps > MAX_BROWSE_STEPS_PER_ATTEMPT {
                                 nav_handle.abort();
+                                if job.found_urls.is_empty() && !fast_scan_candidate_urls.is_empty() {
+                                    self.log(
+                                        &job.id,
+                                        "WARNING",
+                                        "browse",
+                                        &format!(
+                                            "Step budget exceeded; using {} cached fast-scan URL candidate(s) as fallback",
+                                            fast_scan_candidate_urls.len()
+                                        ),
+                                    )
+                                    .await?;
+                                    return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                                }
                                 return Err(anyhow::anyhow!(
                                     "Step budget exceeded: attempt produced {emitted_steps} steps (limit {MAX_BROWSE_STEPS_PER_ATTEMPT})"
                                 ));
                             }
                             if adjusted_step > MAX_BROWSE_STEPS_PER_JOB {
                                 nav_handle.abort();
+                                if job.found_urls.is_empty() && !fast_scan_candidate_urls.is_empty() {
+                                    self.log(
+                                        &job.id,
+                                        "WARNING",
+                                        "browse",
+                                        &format!(
+                                            "Job step budget exceeded; using {} cached fast-scan URL candidate(s) as fallback",
+                                            fast_scan_candidate_urls.len()
+                                        ),
+                                    )
+                                    .await?;
+                                    return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                                }
                                 return Err(anyhow::anyhow!(
                                     "Step budget exceeded: job reached step {adjusted_step} (limit {MAX_BROWSE_STEPS_PER_JOB})"
                                 ));
@@ -914,9 +1189,140 @@ impl JobRunner {
                                     }
                                     if navigation_loop_detected(&recent_navigate_urls) {
                                         nav_handle.abort();
+                                        if job.found_urls.is_empty()
+                                            && !fast_scan_candidate_urls.is_empty()
+                                        {
+                                            self.log(
+                                                &job.id,
+                                                "WARNING",
+                                                "browse",
+                                                &format!(
+                                                    "Navigation loop detected; using {} cached fast-scan URL candidate(s) as fallback",
+                                                    fast_scan_candidate_urls.len()
+                                                ),
+                                            )
+                                            .await?;
+                                            return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                                        }
                                         return Err(anyhow::anyhow!(
                                             "Navigation loop detected while browsing"
                                         ));
+                                    }
+                                }
+
+                                if scanned_page_urls.insert(url.clone()) {
+                                    match self
+                                        .scan_page_for_download_candidates(
+                                            &job.id,
+                                            &url,
+                                            task_prompt,
+                                            &job.file_filter,
+                                        )
+                                        .await
+                                    {
+                                        Ok(scan) => {
+                                            if let Some(status) = scan.status_code {
+                                                if status >= 400 {
+                                                    consecutive_unreachable_navigations += 1;
+                                                    self.log(
+                                                        &job.id,
+                                                        "WARNING",
+                                                        "browse",
+                                                        &format!(
+                                                            "Fast scan probe saw HTTP {status} for navigate target {url}"
+                                                        ),
+                                                    )
+                                                    .await?;
+
+                                                    if consecutive_unreachable_navigations >= 2
+                                                        && job.found_urls.is_empty()
+                                                        && !fast_scan_candidate_urls.is_empty()
+                                                    {
+                                                        nav_handle.abort();
+                                                        self.log(
+                                                            &job.id,
+                                                            "WARNING",
+                                                            "browse",
+                                                            &format!(
+                                                                "Repeated unreachable navigation targets; using {} cached fast-scan URL candidate(s)",
+                                                                fast_scan_candidate_urls.len()
+                                                            ),
+                                                        )
+                                                        .await?;
+                                                        return Ok(fallback_outcome(
+                                                            &fast_scan_candidate_urls,
+                                                        ));
+                                                    }
+                                                } else {
+                                                    consecutive_unreachable_navigations = 0;
+                                                }
+                                            }
+
+                                            if scan.total_links >= 250 {
+                                                self.log(
+                                                    &job.id,
+                                                    "INFO",
+                                                    "browse",
+                                                    &format!(
+                                                        "Scanned large link page ({}) with {} links",
+                                                        url, scan.total_links
+                                                    ),
+                                                )
+                                                .await?;
+                                            }
+
+                                            let mut discovered_count = 0usize;
+                                            for found_url in scan.download_urls {
+                                                if failed_url_set.contains(&found_url) {
+                                                    continue;
+                                                }
+                                                if job
+                                                    .found_urls
+                                                    .iter()
+                                                    .any(|existing| existing == &found_url)
+                                                {
+                                                    continue;
+                                                }
+                                                if fast_scan_candidate_urls
+                                                    .iter()
+                                                    .any(|existing| existing == &found_url)
+                                                {
+                                                    continue;
+                                                }
+                                                if fast_scan_candidate_urls.len()
+                                                    >= MAX_FAST_SCAN_CANDIDATES
+                                                {
+                                                    break;
+                                                }
+                                                fast_scan_candidate_urls.push(found_url);
+                                                discovered_count += 1;
+                                            }
+
+                                            if discovered_count > 0 {
+                                                self.log(
+                                                    &job.id,
+                                                    "INFO",
+                                                    "browse",
+                                                    &format!(
+                                                        "Fast link scan captured {discovered_count} new candidate URL(s), {} cached total",
+                                                        fast_scan_candidate_urls.len()
+                                                    ),
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            let _ = self
+                                                .log(
+                                                    &job.id,
+                                                    "DEBUG",
+                                                    "browse",
+                                                    &format!(
+                                                        "Fast link scan skipped for {url}: {err}"
+                                                    ),
+                                                )
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -986,6 +1392,19 @@ impl JobRunner {
                 }
                 _ = &mut attempt_timeout => {
                     nav_handle.abort();
+                    if job.found_urls.is_empty() && !fast_scan_candidate_urls.is_empty() {
+                        self.log(
+                            &job.id,
+                            "WARNING",
+                            "browse",
+                            &format!(
+                                "Browse timeout hit; using {} cached fast-scan URL candidate(s) as fallback",
+                                fast_scan_candidate_urls.len()
+                            ),
+                        )
+                        .await?;
+                        return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                    }
                     return Err(anyhow::anyhow!(
                         "Browse attempt timed out after {}s",
                         BROWSE_ATTEMPT_TIMEOUT.as_secs()
@@ -1017,17 +1436,274 @@ impl JobRunner {
         }
 
         match nav_handle.await {
-            Ok(Ok(outcome)) => Ok(outcome),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(anyhow::anyhow!("Browse task crashed: {err}")),
+            Ok(Ok(mut outcome)) => {
+                let has_agent_urls = !job.found_urls.is_empty() || !outcome.found_urls.is_empty();
+                if !has_agent_urls && !fast_scan_candidate_urls.is_empty() {
+                    self.log(
+                        &job.id,
+                        "INFO",
+                        "browse",
+                        &format!(
+                            "Using {} fast-scan URL candidate(s) as fallback because agent did not emit any URLs",
+                            fast_scan_candidate_urls.len()
+                        ),
+                    )
+                    .await?;
+                    outcome.found_urls = fast_scan_candidate_urls;
+                }
+                Ok(outcome)
+            }
+            Ok(Err(err)) => {
+                if job.found_urls.is_empty() && !fast_scan_candidate_urls.is_empty() {
+                    self.log(
+                        &job.id,
+                        "WARNING",
+                        "browse",
+                        &format!(
+                            "Browser session ended with error ({err}); using {} cached fast-scan URL candidate(s) instead",
+                            fast_scan_candidate_urls.len()
+                        ),
+                    )
+                    .await?;
+                    return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                }
+                Err(err)
+            }
+            Err(err) => {
+                if job.found_urls.is_empty() && !fast_scan_candidate_urls.is_empty() {
+                    self.log(
+                        &job.id,
+                        "WARNING",
+                        "browse",
+                        &format!(
+                            "Browse task crashed ({err}); using {} cached fast-scan URL candidate(s) instead",
+                            fast_scan_candidate_urls.len()
+                        ),
+                    )
+                    .await?;
+                    return Ok(fallback_outcome(&fast_scan_candidate_urls));
+                }
+                Err(anyhow::anyhow!("Browse task crashed: {err}"))
+            }
         }
+    }
+
+    async fn scan_page_for_download_candidates(
+        &self,
+        _job_id: &str,
+        page_url: &str,
+        task_prompt: &str,
+        file_filter: &[String],
+    ) -> Result<PageScanResult> {
+        let base_url = reqwest::Url::parse(page_url)
+            .with_context(|| format!("invalid URL for page scan: {page_url}"))?;
+
+        if !matches!(base_url.scheme(), "http" | "https") {
+            return Ok(PageScanResult::default());
+        }
+
+        let response = self
+            .http_client
+            .get(page_url)
+            .timeout(Duration::from_secs(20))
+            .header("accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .with_context(|| format!("GET failed during page scan for {page_url}"))?;
+
+        let status_code = Some(response.status().as_u16());
+        if !response.status().is_success() {
+            return Ok(PageScanResult {
+                status_code,
+                ..PageScanResult::default()
+            });
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !content_type.contains("text/html") && !content_type.contains("application/xhtml+xml") {
+            return Ok(PageScanResult {
+                status_code,
+                ..PageScanResult::default()
+            });
+        }
+
+        let html = response
+            .text()
+            .await
+            .with_context(|| format!("reading HTML body for {page_url}"))?;
+        if html.len() > 4_000_000 {
+            return Ok(PageScanResult {
+                status_code,
+                ..PageScanResult::default()
+            });
+        }
+
+        let anchors = extract_anchor_candidates(&html);
+        if anchors.is_empty() {
+            return Ok(PageScanResult {
+                status_code,
+                ..PageScanResult::default()
+            });
+        }
+
+        let total_links = anchors.len();
+        let prompt_keywords = extract_prompt_keywords(task_prompt);
+        let filter_keywords = extract_file_filter_keywords(file_filter);
+        let mut keywords = Vec::new();
+        let mut seen_keywords = HashSet::new();
+        for keyword in prompt_keywords
+            .into_iter()
+            .chain(filter_keywords.into_iter())
+        {
+            if seen_keywords.insert(keyword.clone()) {
+                keywords.push(keyword);
+            }
+            if keywords.len() >= 24 {
+                break;
+            }
+        }
+
+        if keywords.is_empty() {
+            return Ok(PageScanResult {
+                status_code,
+                total_links,
+                ..PageScanResult::default()
+            });
+        }
+
+        let mut candidates = Vec::new();
+        for (href, text) in anchors {
+            let href = href.trim();
+            if href.is_empty()
+                || href.starts_with('#')
+                || href.starts_with("javascript:")
+                || href.starts_with("mailto:")
+            {
+                continue;
+            }
+
+            let absolute = if href.starts_with("magnet:") {
+                href.to_string()
+            } else {
+                match base_url.join(href) {
+                    Ok(joined) => joined.to_string(),
+                    Err(_) => continue,
+                }
+            };
+            if !is_candidate_link_target(&absolute) {
+                continue;
+            }
+
+            let lowered_url = decode_percent_escapes(&absolute).to_ascii_lowercase();
+            let lowered_text = decode_percent_escapes(&text).to_ascii_lowercase();
+            let haystack = format!(
+                "{} {} {}",
+                lowered_url,
+                lowered_text,
+                href.to_ascii_lowercase()
+            );
+
+            candidates.push((absolute, haystack));
+        }
+
+        if candidates.is_empty() {
+            return Ok(PageScanResult {
+                status_code,
+                total_links,
+                ..PageScanResult::default()
+            });
+        }
+
+        let mut keyword_frequency = HashMap::new();
+        for keyword in &keywords {
+            let freq = candidates
+                .iter()
+                .filter(|(_, haystack)| haystack.contains(keyword))
+                .count();
+            if freq > 0 {
+                keyword_frequency.insert(keyword.clone(), freq);
+            }
+        }
+
+        if keyword_frequency.is_empty() {
+            return Ok(PageScanResult {
+                status_code,
+                total_links,
+                ..PageScanResult::default()
+            });
+        }
+
+        let candidate_count = candidates.len().max(1);
+        let mut scored = Vec::new();
+        for (absolute, haystack) in candidates {
+            let mut score = 0_i32;
+            let mut matched = 0_usize;
+            for keyword in &keywords {
+                if !haystack.contains(keyword) {
+                    continue;
+                }
+
+                matched += 1;
+                let freq = keyword_frequency
+                    .get(keyword)
+                    .copied()
+                    .unwrap_or(candidate_count);
+                let rarity = candidate_count.saturating_sub(freq) + 1;
+                score += (rarity as i32) * 4;
+            }
+
+            if matched == 0 {
+                continue;
+            }
+            if matched == keywords.len() && keywords.len() > 1 {
+                score += 20;
+            } else if matched > 1 {
+                score += (matched as i32) * 4;
+            }
+
+            scored.push((score, matched, absolute));
+        }
+
+        scored.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+
+        let mut seen_urls = HashSet::new();
+        let mut download_urls = Vec::new();
+        for (score, _, url) in scored {
+            if score <= 0 {
+                continue;
+            }
+            if seen_urls.insert(url.clone()) {
+                download_urls.push(url);
+            }
+            if download_urls.len() >= MAX_FAST_SCAN_CANDIDATES {
+                break;
+            }
+        }
+
+        Ok(PageScanResult {
+            status_code,
+            total_links,
+            download_urls,
+        })
     }
 
     async fn apply_navigation_outcome(
         &self,
         job: &mut Job,
         navigation: &NavigationOutcome,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut added_filter_hints = 0usize;
         merge_unique_strings(&mut job.found_urls, &navigation.found_urls);
 
         if !navigation.downloaded_files.is_empty() {
@@ -1061,6 +1737,7 @@ impl JobRunner {
                 merge_unique_strings(&mut job.file_filter, &suggested_filters);
                 let added = job.file_filter.len().saturating_sub(before);
                 if added > 0 {
+                    added_filter_hints += added;
                     self.log(
                         &job.id,
                         "INFO",
@@ -1117,7 +1794,7 @@ impl JobRunner {
             }
         }
 
-        Ok(())
+        Ok(added_filter_hints)
     }
 
     fn job_local_path_policy(&self, job: &Job) -> Option<LocalPathPolicy> {
@@ -1268,10 +1945,9 @@ impl JobRunner {
             if url.starts_with("magnet:") {
                 continue;
             }
-            let domain = reqwest::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .unwrap_or_else(|| url.clone());
+            let Some(domain) = domain_from_input(url) else {
+                continue;
+            };
             let content = if success {
                 format!("Download succeeded from {domain}")
             } else {
@@ -1334,18 +2010,133 @@ impl JobRunner {
                         &format!("Attempt {attempt}/{attempts} failed for {url}: {err}"),
                     )
                     .await?;
+                    let retryable = is_retryable_download_error(&err);
                     last_error = Some(err);
 
-                    if attempt < attempts {
+                    if attempt < attempts && retryable {
                         let backoff = self.config.download_retry_backoff_sec
                             * 2f64.powi((attempt - 1) as i32);
                         tokio::time::sleep(Duration::from_secs_f64(backoff.max(0.0))).await;
+                    } else if attempt < attempts {
+                        self.log(
+                            job_id,
+                            "INFO",
+                            "download",
+                            &format!(
+                                "Skipping remaining retries for {url} because error is non-retryable"
+                            ),
+                        )
+                        .await?;
+                        break;
                     }
                 }
             }
         }
 
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed for {url}")))
+    }
+
+    async fn filter_download_candidates(
+        &self,
+        _job_id: &str,
+        urls: &[String],
+    ) -> Result<(Vec<String>, Vec<(String, String)>)> {
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+
+        for url in urls {
+            match self.non_downloadable_candidate_reason(url).await {
+                Some(reason) => rejected.push((url.clone(), reason)),
+                None => accepted.push(url.clone()),
+            }
+        }
+
+        Ok((accepted, rejected))
+    }
+
+    async fn non_downloadable_candidate_reason(&self, url: &str) -> Option<String> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Some("empty URL".to_string());
+        }
+
+        if trimmed.starts_with("magnet:") || trimmed.starts_with("torrent:") {
+            return None;
+        }
+
+        let parsed = reqwest::Url::parse(trimmed).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return None;
+        }
+
+        let head = self
+            .http_client
+            .head(trimmed)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+
+        let response = match head {
+            Ok(resp) if resp.status().is_success() => Some(resp),
+            Ok(resp)
+                if matches!(
+                    resp.status().as_u16(),
+                    405 | 501 // method unsupported; fallback to a lightweight GET probe
+                ) =>
+            {
+                None
+            }
+            Ok(resp) => {
+                return Some(format!("metadata probe returned HTTP {}", resp.status()));
+            }
+            Err(_) => None,
+        };
+
+        let response = if let Some(resp) = response {
+            resp
+        } else {
+            match self
+                .http_client
+                .get(trimmed)
+                .header("range", "bytes=0-1023")
+                .timeout(Duration::from_secs(12))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => resp,
+                Ok(resp) => {
+                    return Some(format!("content probe returned HTTP {}", resp.status()));
+                }
+                Err(_) => return None,
+            }
+        };
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let content_disposition = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let has_filename = content_disposition.contains("filename=");
+        let has_attachment = content_disposition.contains("attachment");
+
+        if (content_type.starts_with("text/html")
+            || content_type.starts_with("application/xhtml+xml"))
+            && !has_filename
+            && !has_attachment
+        {
+            return Some(format!(
+                "content-type `{content_type}` indicates an HTML page"
+            ));
+        }
+
+        None
     }
 
     async fn download_url(
@@ -1374,7 +2165,9 @@ impl JobRunner {
             .and_then(|h| h.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if content_type.starts_with("text/html") {
+        if content_type.starts_with("text/html")
+            || content_type.starts_with("application/xhtml+xml")
+        {
             return Err(anyhow::anyhow!(
                 "server returned html instead of file for {}",
                 url
@@ -1510,6 +2303,113 @@ impl JobRunner {
     }
 }
 
+#[derive(Debug, Default)]
+struct PageScanResult {
+    status_code: Option<u16>,
+    total_links: usize,
+    download_urls: Vec<String>,
+}
+
+fn extract_anchor_candidates(html: &str) -> Vec<(String, String)> {
+    let Ok(anchor_re) = Regex::new(r#"(?is)<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>"#)
+    else {
+        return Vec::new();
+    };
+    let Ok(tag_re) = Regex::new(r"(?is)<[^>]+>") else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for capture in anchor_re.captures_iter(html) {
+        let Some(href_match) = capture.get(1) else {
+            continue;
+        };
+        let href = href_match.as_str().trim();
+        if href.is_empty() {
+            continue;
+        }
+
+        let text = capture
+            .get(2)
+            .map(|m| m.as_str())
+            .unwrap_or_default()
+            .replace('\n', " ");
+        let text = tag_re.replace_all(&text, "");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        candidates.push((href.to_string(), text));
+    }
+
+    candidates
+}
+
+fn extract_prompt_keywords(prompt: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut keywords = Vec::new();
+    for token in prompt
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+    {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_numeric = trimmed.chars().all(|ch| ch.is_ascii_digit());
+        if trimmed.len() < 2 && !is_numeric {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            keywords.push(trimmed.to_string());
+        }
+        if keywords.len() >= 20 {
+            break;
+        }
+    }
+    keywords
+}
+
+fn extract_file_filter_keywords(file_filter: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut keywords = Vec::new();
+
+    for pattern in file_filter {
+        for token in pattern
+            .to_ascii_lowercase()
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+        {
+            let trimmed = token.trim();
+            if trimmed.len() < 2 {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                keywords.push(trimmed.to_string());
+            }
+            if keywords.len() >= 12 {
+                return keywords;
+            }
+        }
+    }
+
+    keywords
+}
+
+fn is_candidate_link_target(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("magnet:")
+}
+
+fn extract_agent_problem(raw_output: &str) -> Option<String> {
+    let Ok(problem_re) = Regex::new(r"(?im)^\s*\[ERROR\]\s*PROBLEM:\s*(.+?)\s*$") else {
+        return None;
+    };
+    let captures = problem_re.captures(raw_output)?;
+    let problem = captures.get(1)?.as_str().trim();
+    if problem.is_empty() {
+        None
+    } else {
+        Some(problem.to_string())
+    }
+}
+
 fn extract_learning_entries(raw_output: &str) -> Vec<(String, String)> {
     let Ok(re) = Regex::new(r"(?is)\[LEARNING:\s*type=(\w+)\]\s*(.+?)(?=\[LEARNING:|$)") else {
         return Vec::new();
@@ -1619,6 +2519,20 @@ fn domain_from_input(input: &str) -> Option<String> {
     })
 }
 
+fn normalize_source_preferences(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for value in values {
+        let Some(domain) = domain_from_input(&value) else {
+            continue;
+        };
+        if seen.insert(domain.clone()) {
+            normalized.push(domain);
+        }
+    }
+    normalized
+}
+
 fn augment_prompt_with_source_context(
     prompt: &str,
     source_url: &str,
@@ -1645,8 +2559,10 @@ fn augment_prompt_with_source_context(
         }
     }
     for domain in preferred_domains {
-        let normalized = normalize_domain(domain);
-        if normalized.is_empty() || failed_domains.contains(&normalized) {
+        let Some(normalized) = domain_from_input(domain) else {
+            continue;
+        };
+        if failed_domains.contains(&normalized) {
             continue;
         }
         if seen_domains.insert(normalized.clone()) {
@@ -1796,6 +2712,31 @@ fn merge_unique_strings(target: &mut Vec<String>, values: &[String]) {
             target.push(value.clone());
         }
     }
+}
+
+fn is_retryable_download_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+
+    if message.contains("server returned html instead of file")
+        || message.contains("blocked write outside local write allowlist")
+        || message.contains("invalid url")
+    {
+        return false;
+    }
+
+    if let Some(idx) = message.find("http status ") {
+        let rest = &message[idx + "http status ".len()..];
+        if let Some(code_token) = rest.split_whitespace().next()
+            && let Ok(code) = code_token.parse::<u16>()
+            && (400..500).contains(&code)
+            && code != 408
+            && code != 429
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn build_file_filter_matcher(patterns: &[String]) -> Option<GlobSet> {
@@ -2081,27 +3022,28 @@ async fn symlink_file(source: &Path, target: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        augment_prompt_with_source_context, domain_from_input, extract_file_filter_entries,
-        infer_filename, navigation_loop_detected, normalize_navigation_url,
-        prompt_prefers_torrent_sources,
+        augment_prompt_with_source_context, domain_from_input, extract_agent_problem,
+        extract_file_filter_entries, extract_prompt_keywords, infer_filename,
+        is_candidate_link_target, navigation_loop_detected, normalize_navigation_url,
+        normalize_source_preferences, prompt_prefers_torrent_sources,
     };
 
     #[test]
     fn source_context_uses_ranked_domains_and_skips_failed_domains() {
         let prompt = augment_prompt_with_source_context(
-            "download the rom",
+            "download the archive",
             "",
             &[
-                "myrient.erista.me".to_string(),
+                "downloads.example.net".to_string(),
                 "archive.org".to_string(),
-                "www.romhustler.net".to_string(),
+                "www.mirror.example.com".to_string(),
             ],
             &["https://archive.org/details/some-pack".to_string()],
         );
 
         assert!(prompt.contains("SOURCE MEMORY FROM PREVIOUS JOBS (ranked):"));
-        assert!(prompt.contains("1. myrient.erista.me"));
-        assert!(prompt.contains("2. romhustler.net"));
+        assert!(prompt.contains("1. downloads.example.net"));
+        assert!(prompt.contains("2. mirror.example.com"));
         assert!(!prompt.contains("2. archive.org"));
         assert!(prompt.contains("Failed URLs to avoid:"));
     }
@@ -2111,12 +3053,15 @@ mod tests {
         let prompt = augment_prompt_with_source_context(
             "download file",
             "https://www.example.com/path",
-            &["myrient.erista.me".to_string(), "example.com".to_string()],
+            &[
+                "downloads.example.net".to_string(),
+                "example.com".to_string(),
+            ],
             &[],
         );
 
         assert!(prompt.contains("1. example.com"));
-        assert!(prompt.contains("2. myrient.erista.me"));
+        assert!(prompt.contains("2. downloads.example.net"));
         assert!(prompt.contains("INSTRUCTION PRIORITY"));
         assert!(
             prompt.contains("If source memory conflicts with the user's request, follow the user.")
@@ -2126,14 +3071,30 @@ mod tests {
     #[test]
     fn domain_parser_handles_urls_and_bare_domains() {
         assert_eq!(
-            domain_from_input("https://www.MYRient.Erista.me/files"),
-            Some("myrient.erista.me".to_string())
+            domain_from_input("https://www.Downloads.Example.net/files"),
+            Some("downloads.example.net".to_string())
         );
         assert_eq!(
-            domain_from_input("romhustler.net/some/path"),
-            Some("romhustler.net".to_string())
+            domain_from_input("mirror.example.com/some/path"),
+            Some("mirror.example.com".to_string())
         );
         assert_eq!(domain_from_input(""), None);
+    }
+
+    #[test]
+    fn source_preferences_drop_non_domain_noise() {
+        let normalized = normalize_source_preferences(vec![
+            "downloads.example.net".to_string(),
+            "torrent:http://127.0.0.1:9117/dl/aniRena/?file=Some+Explicit+Title".to_string(),
+            "https://archive.org/details/example".to_string(),
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                "downloads.example.net".to_string(),
+                "archive.org".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2141,10 +3102,10 @@ mod tests {
         let history = vec![
             normalize_navigation_url("https://example.com"),
             normalize_navigation_url("https://example.com/files"),
-            normalize_navigation_url("https://example.com/files/nes"),
+            normalize_navigation_url("https://example.com/files/project"),
             normalize_navigation_url("https://example.com"),
             normalize_navigation_url("https://example.com/files"),
-            normalize_navigation_url("https://example.com/files/nes"),
+            normalize_navigation_url("https://example.com/files/project"),
         ];
         assert!(navigation_loop_detected(&history));
     }
@@ -2166,6 +3127,33 @@ mod tests {
     }
 
     #[test]
+    fn prompt_keywords_keep_specific_terms_and_drop_noise() {
+        let keywords = extract_prompt_keywords("find quarterly report 2024 report");
+        assert!(keywords.contains(&"find".to_string()));
+        assert!(keywords.contains(&"quarterly".to_string()));
+        assert!(keywords.contains(&"report".to_string()));
+        assert!(keywords.contains(&"2024".to_string()));
+        assert_eq!(
+            keywords
+                .iter()
+                .filter(|item| item.as_str() == "report")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn candidate_link_target_accepts_supported_schemes() {
+        assert!(is_candidate_link_target(
+            "https://example.com/download?id=123"
+        ));
+        assert!(is_candidate_link_target(
+            "magnet:?xt=urn:btih:abcdef1234567890"
+        ));
+        assert!(!is_candidate_link_target("ftp://example.com/file.bin"));
+    }
+
+    #[test]
     fn file_filter_entries_parse_structured_lines() {
         let output = "\
             [FILE_FILTER] PATTERN: *invoice*\n\
@@ -2184,6 +3172,18 @@ mod tests {
     }
 
     #[test]
+    fn agent_problem_parser_extracts_explicit_problem_line() {
+        let output = "\
+            Investigating source page...\n\
+            [ERROR] PROBLEM: no downloadable artifact exists on this source\n\
+            [RESULT] SUCCESS: false\n";
+        assert_eq!(
+            extract_agent_problem(output),
+            Some("no downloadable artifact exists on this source".to_string())
+        );
+    }
+
+    #[test]
     fn file_filter_entries_ignore_empty_noise() {
         let output = "\
             [FILE_FILTER] PATTERN:\n\
@@ -2197,18 +3197,18 @@ mod tests {
     #[test]
     fn infer_filename_decodes_percent_encoded_url_segments() {
         let name = infer_filename(
-            "https://example.com/files/Internet%20Archive%20Pack.zip",
+            "https://example.com/files/Project%20Assets%20Bundle.tar",
             "",
         );
-        assert_eq!(name, "Internet Archive Pack.zip");
+        assert_eq!(name, "Project Assets Bundle.tar");
     }
 
     #[test]
     fn infer_filename_decodes_percent_encoded_content_disposition() {
         let name = infer_filename(
             "https://example.com/files/download",
-            "attachment; filename=\"Super%20Mario%203.nes\"",
+            "attachment; filename=\"Quarterly%20Report%202024.pdf\"",
         );
-        assert_eq!(name, "Super Mario 3.nes");
+        assert_eq!(name, "Quarterly Report 2024.pdf");
     }
 }
