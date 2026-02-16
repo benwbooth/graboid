@@ -18,3 +18,8 @@ graboid-rs/frontend/target/
 graboid-rs-data/
 graboid-rs/graboid-rs-data/
 downloads/
+
+# Local environment/runtime artifacts
+/.direnv/
+/jobs.db
+/snapshot.txt
